@@ -1,5 +1,5 @@
 //! Sema - Semantic File Search
-//! 
+//!
 //! A terminal application for crawling text files recursively and providing
 //! semantic search capabilities using local embedding models and Qdrant vector database.
 

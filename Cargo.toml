@@ -1,67 +1,66 @@
 [package]
 name = "sema"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # Terminal User Interface
-ratatui = "0.26"
-crossterm = "0.27"
-tui-input = "0.9"
-tui-textarea = "0.4"
+ratatui = "0.29.0"
+crossterm = "0.29"
+tui-input = "0.12.1"
+tui-textarea = "0.7.0"
 
 # Async runtime and utilities
-tokio = { version = "1.0", features = ["full"] }
-tokio-util = "0.7"
-futures = "0.3"
-parking_lot = "0.12"
+tokio = "1.45.1"
+tokio-util = "0.7.15"
+futures = "0.3.31"
+parking_lot = "0.12.4"
 
 # File system operations
-walkdir = "2.4"
-mime_guess = "2.0"
-encoding_rs = "0.8"
-ignore = "0.4"
+walkdir = "2.5.0"
+mime_guess = "2.0.5"
+mime = "0.3.17"
+encoding_rs = "0.8.35"
+ignore = "0.4.23"
+sha2 = "0.10.9"
 
 # Text processing
-regex = "1.10"
-unicode-segmentation = "1.10"
-unicode-width = "0.1"
-stopwords = "0.1"
+regex = "1.11.1"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2.0"
 
 # Vector database
-qdrant-client = "1.9"
+qdrant-client = "1.14.0"
 
 # Embedding generation (local models)
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-tokenizers = "0.15"
-hf-hub = "0.3"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+tokenizers = "0.21.1"
+hf-hub = "0.4.2"
 
 # Syntax highlighting for file previews
-syntect = "5.2"
+syntect = "5.2.0"
 
 # Configuration management
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
-config = "0.14"
-dirs = "5.0"
+serde = "1.0.219"
+serde_json = "1.0.140"
+toml = "0.8.22"
+config = "0.15.11"
+dirs = "6.0.0"
 
 # Command line interface
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5.39", features = ["derive"] }
 
 # Progress indication
-indicatif = "0.17"
-console = "0.15"
+indicatif = "0.17.11"
+console = "0.15.11"
 
 # Error handling and utilities
-anyhow = "1.0"
-thiserror = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-uuid = { version = "1.6", features = ["v4"] }
+anyhow = "1.0.98"
+thiserror = "2.0.12"
+uuid = { version = "1.17.0", features = ["v4"] }
 
 # Performance utilities
-rayon = "1.8"
-dashmap = "5.5"
+rayon = "1.10.0"
+dashmap = "6.1.0"

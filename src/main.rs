@@ -1,31 +1,39 @@
-use clap::Parser;
-use sema::cli::{handle_command, Cli};
-use sema::tui::App;
 use anyhow::Result;
+use clap::Parser;
+use sema::cli::Cli;
+use sema::tui::App;
+use std::env;
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
-    // Parse command line arguments
     let cli = Cli::parse();
 
-    // Handle verbose logging
-    if cli.verbose {
-        println!("Verbose mode enabled");
+    let target_directory = if let Some(dir) = cli.directory {
+        dir.canonicalize().unwrap_or_else(|_| {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(dir)
+        })
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+
+    if !target_directory.exists() {
+        eprintln!(
+            "Error: Directory '{}' does not exist",
+            target_directory.display()
+        );
+        std::process::exit(1);
     }
 
-    // If a subcommand is provided, handle it
-    if let Some(command) = cli.command {
-        handle_command(command).await?;
-        return Ok(());
+    if !target_directory.is_dir() {
+        eprintln!("Error: '{}' is not a directory", target_directory.display());
+        std::process::exit(1);
     }
 
-    // Default behavior: Launch TUI
-    println!("Launching Sema TUI...");
-    let mut app = App::new();
-    app.run()?;
+    let mut app = App::new_with_directory(target_directory)?;
+    app.run().await?;
 
     Ok(())
 }
