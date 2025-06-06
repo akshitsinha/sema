@@ -1,0 +1,25 @@
+# Embedding Models Configuration
+
+[models.all_minilm_l6_v2]
+name = "sentence-transformers/all-MiniLM-L6-v2"
+embedding_dim = 384
+max_sequence_length = 512
+model_size_mb = 23
+description = "Lightweight model optimized for speed and efficiency"
+recommended = true
+
+[models.all_mpnet_base_v2]
+name = "sentence-transformers/all-mpnet-base-v2"
+embedding_dim = 768
+max_sequence_length = 514
+model_size_mb = 420
+description = "Higher quality model with better semantic understanding"
+recommended = false
+
+[models.paraphrase_minilm_l6_v2]
+name = "sentence-transformers/paraphrase-MiniLM-L6-v2"
+embedding_dim = 384
+max_sequence_length = 512
+model_size_mb = 23
+description = "Optimized for paraphrase detection and code similarity"
+recommended = false

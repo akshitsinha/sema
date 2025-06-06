@@ -1,0 +1,29 @@
+# Sema Configuration File
+
+[general]
+# Default directory to index if none specified
+default_directory = "."
+
+# Maximum file size to process (in bytes)
+max_file_size = 10485760  # 10MB
+
+# File extensions to include
+file_extensions = ["txt", "md", "rs", "py", "js", "ts", "go", "java", "cpp", "c", "json", "yaml", "toml", "xml", "log"]
+
+[qdrant]
+# Qdrant server configuration
+url = "http://localhost:6334"
+collection_name = "sema_documents"
+
+[embeddings]
+# Embedding model configuration
+model_name = "sentence-transformers/all-MiniLM-L6-v2"
+embedding_dim = 384
+max_sequence_length = 512
+chunk_size = 512
+chunk_overlap = 50
+
+[tui]
+# TUI configuration
+refresh_rate = 60  # FPS
+search_debounce_ms = 300
