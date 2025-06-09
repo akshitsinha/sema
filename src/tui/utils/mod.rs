@@ -1,2 +1,3 @@
-// Placeholder for TUI utilities
-// Will be implemented in later milestones
+pub mod spinner;
+
+pub use spinner::*;

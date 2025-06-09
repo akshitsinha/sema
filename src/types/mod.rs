@@ -6,6 +6,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: PathBuf,
+    pub filename: String,
     pub content: String,
     pub size: u64,
     pub modified: SystemTime,
@@ -14,21 +15,19 @@ pub struct FileEntry {
     pub hash: String,
 }
 
-/// Progress information for file crawling
-#[derive(Debug, Clone)]
-pub struct CrawlProgress {
-    pub files_discovered: usize,
-    pub files_processed: usize,
-    pub bytes_processed: u64,
-    pub current_file: Option<PathBuf>,
-    pub errors: Vec<CrawlError>,
-}
-
-/// Errors that can occur during crawling
-#[derive(Debug, Clone)]
-pub struct CrawlError {
-    pub path: PathBuf,
-    pub error: String,
+impl Default for FileEntry {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            filename: String::new(),
+            content: String::new(),
+            size: 0,
+            modified: SystemTime::UNIX_EPOCH,
+            mime_type: String::new(),
+            encoding: String::new(),
+            hash: String::new(),
+        }
+    }
 }
 
 /// Configuration for the file crawler
@@ -39,4 +38,61 @@ pub struct CrawlerConfig {
     pub include_hidden: bool,
     pub file_extensions: Vec<String>,
     pub exclude_patterns: Vec<String>,
+    pub ignore_gitignore: bool,
+}
+
+impl Default for CrawlerConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 10_485_760, // 10MB
+            follow_symlinks: false,
+            include_hidden: false,
+            file_extensions: vec![
+                "txt".to_string(),
+                "md".to_string(),
+                "rs".to_string(),
+                "py".to_string(),
+                "js".to_string(),
+                "ts".to_string(),
+                "go".to_string(),
+                "java".to_string(),
+                "cpp".to_string(),
+                "c".to_string(),
+                "json".to_string(),
+                "yaml".to_string(),
+                "toml".to_string(),
+                "xml".to_string(),
+                "log".to_string(),
+            ],
+            exclude_patterns: vec![
+                ".git".to_string(),
+                "target".to_string(),
+                "node_modules".to_string(),
+                ".cache".to_string(),
+                "*.tmp".to_string(),
+                "*.log".to_string(),
+            ],
+            ignore_gitignore: true,
+        }
+    }
+}
+
+impl From<&crate::config::GeneralConfig> for CrawlerConfig {
+    fn from(general_config: &crate::config::GeneralConfig) -> Self {
+        Self {
+            max_file_size: general_config.max_file_size,
+            follow_symlinks: general_config.follow_symlinks,
+            include_hidden: general_config.include_hidden,
+            file_extensions: general_config.file_extensions.clone(),
+            exclude_patterns: general_config.exclude_patterns.clone(),
+            ignore_gitignore: general_config.ignore_gitignore,
+        }
+    }
+}
+
+/// Application state for the TUI
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppState {
+    Crawling,
+    Ready,
 }

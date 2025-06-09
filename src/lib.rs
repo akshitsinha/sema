@@ -11,7 +11,6 @@ pub mod search;
 pub mod storage;
 pub mod tui;
 pub mod types;
-pub mod utils;
 pub mod vector_db;
 
 pub use anyhow::{Error, Result};
