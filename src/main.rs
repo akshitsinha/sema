@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     // Validate directory
     validate_directory(&target_directory)?;
 
-    // Create and run app with configuration
+    // Default: Create and run TUI app
     let mut app = App::new_with_directory(target_directory, config)?;
     app.run().await?;
 

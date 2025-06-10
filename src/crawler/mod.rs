@@ -1,4 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::fs::{File, Metadata};
+use std::ffi::OsStr;
+use memmap2::Mmap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
@@ -7,92 +11,74 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::types::{CrawlerConfig, FileEntry};
 
-/// File crawler that recursively discovers and processes text files
+/// File crawler that finds text files in directories.
 pub struct FileCrawler {
     config: CrawlerConfig,
 }
 
 impl FileCrawler {
-    /// Create a new file crawler with the given configuration
+    /// Creates a new file crawler with the given configuration.
     pub fn new(config: CrawlerConfig) -> Self {
         Self { config }
     }
 
-    /// Crawl directory using all CPU cores for maximum speed
+    /// Crawls a directory and sends found files through the channel.
     pub async fn crawl_directory(
         &self,
         root_path: &Path,
         file_tx: async_mpsc::UnboundedSender<FileEntry>,
     ) -> Result<()> {
         let root_path = root_path.to_owned();
-        let config = self.config.clone();
+        let config = Arc::new(self.config.clone());
 
-        // Spawn blocking task for file system operations
-        let handle =
-            tokio::task::spawn_blocking(move || Self::crawl_blocking(root_path, config, file_tx));
-
-        handle.await.context("Crawler task failed")?
+        tokio::task::spawn_blocking(move || {
+            Self::crawl_with_batching(root_path, config, file_tx)
+        })
+        .await
+        .context("Crawler task failed")?
     }
 
-    /// Crawl using all CPU cores - collect paths only for speed
-    fn crawl_blocking(
+    /// Fast parallel crawling with maximum CPU utilization.
+    fn crawl_with_batching(
         root_path: PathBuf,
-        config: CrawlerConfig,
+        config: Arc<CrawlerConfig>,
         file_tx: async_mpsc::UnboundedSender<FileEntry>,
     ) -> Result<()> {
-        // Use all available CPU cores for directory traversal
+        // Use maximum CPU cores for directory traversal
+        let thread_count = (num_cpus::get() * 2).max(8);
         let mut walker = WalkBuilder::new(&root_path);
+        
         walker
             .follow_links(config.follow_symlinks)
             .hidden(!config.include_hidden)
             .max_filesize(Some(config.max_file_size))
-            .threads(num_cpus::get());
-
-        // Configure gitignore handling
-        if config.ignore_gitignore {
-            walker
-                .git_ignore(true)
-                .git_global(true)
-                .git_exclude(true);
-        } else {
-            walker
-                .git_ignore(false)
-                .git_global(false)
-                .git_exclude(false);
-        }
+            .threads(thread_count)
+            .skip_stdout(true)
+            .git_ignore(config.ignore_gitignore)
+            .git_global(config.ignore_gitignore)
+            .git_exclude(config.ignore_gitignore);
 
         // Add exclude patterns
         for pattern in &config.exclude_patterns {
             walker.add_ignore(&format!("!{}", pattern));
         }
 
-        // Process files directly in parallel walker for maximum efficiency
         let walker = walker.build_parallel();
-        let file_tx_ref = &file_tx;
-        let config_ref = &config;
-
+        
         walker.run(|| {
-            let file_tx = file_tx_ref.clone();
-
+            let file_tx = file_tx.clone();
+            let config = config.clone();
+            
             Box::new(move |entry| {
                 if let Ok(entry) = entry {
                     let path = entry.path();
-                    if path.is_file() && Self::should_include_file(path, config_ref) {
-                        // Check if file is text/UTF-8 before including it
-                        if Self::is_text_file(path, config_ref.max_file_size) {
-                            // Create and send file entry immediately - no intermediate collection
-                            let file_entry = FileEntry {
-                                path: path.to_owned(),
-                                filename: path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                                ..Default::default()
-                            };
-
-                            // Send directly from the parallel walker
-                            let _ = file_tx.send(file_entry);
+                    
+                    if path.is_file() && Self::should_include_file(path, &config) {
+                        if let Ok(metadata) = path.metadata() {
+                            if metadata.len() <= config.max_file_size && Self::is_text_file(path) {
+                                let file_entry = Self::create_file_entry(path.to_owned(), metadata);
+                                let _ = file_tx.send(file_entry);
+                            }
                         }
                     }
                 }
@@ -103,192 +89,173 @@ impl FileCrawler {
         Ok(())
     }
 
-    /// File filtering with minimal checks for performance
+    /// Check if file should be included based on configuration.
     fn should_include_file(path: &Path, config: &CrawlerConfig) -> bool {
-        // If specific extensions are provided, use pattern matching
+        // Check lock files first
+        if config.ignore_lock_files && Self::is_lock_file(path) {
+            return false;
+        }
+
+        // Filter by file extension
         if !config.file_extensions.is_empty() {
-            // Check for wildcard pattern that includes all files
             if config.file_extensions.iter().any(|ext| ext == "*") {
                 return true;
             }
 
-            if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-                let extension = extension.to_lowercase();
-                return config.file_extensions.iter().any(|ext| {
-                    let ext_lower = ext.to_lowercase();
-                    // Support wildcard patterns like "*.rs" or just "rs"
-                    if ext_lower.starts_with("*.") {
-                        extension == ext_lower.trim_start_matches("*.")
-                    } else {
-                        extension == ext_lower
-                    }
-                });
-            } else {
-                // When extensions are specified but file has no extension,
-                // only include if there's a pattern that matches extensionless files
-                return config
-                    .file_extensions
-                    .iter()
-                    .any(|ext| ext == "*" || ext == "");
+            if let Some(extension) = path.extension() {
+                return Self::extension_matches(extension, &config.file_extensions);
             }
-        }
-
-        // If no extensions specified, use sensible defaults for text files
-        if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-            let ext = extension.to_lowercase();
-            return matches!(
-                ext.as_str(),
-                "txt"
-                    | "rs"
-                    | "py"
-                    | "js"
-                    | "ts"
-                    | "jsx"
-                    | "tsx"
-                    | "html"
-                    | "css"
-                    | "scss"
-                    | "json"
-                    | "xml"
-                    | "yaml"
-                    | "yml"
-                    | "toml"
-                    | "md"
-                    | "markdown"
-                    | "rst"
-                    | "c"
-                    | "cpp"
-                    | "h"
-                    | "hpp"
-                    | "java"
-                    | "kt"
-                    | "go"
-                    | "rb"
-                    | "php"
-                    | "sh"
-                    | "bash"
-                    | "zsh"
-                    | "fish"
-                    | "ps1"
-                    | "bat"
-                    | "dockerfile"
-                    | "vue"
-                    | "svelte"
-                    | "sass"
-                    | "less"
-                    | "ini"
-                    | "conf"
-                    | "cfg"
-                    | "log"
-                    | "tex"
-                    | "sql"
-                    | "r"
-                    | "swift"
-                    | "scala"
-                    | "clj"
-                    | "elm"
-                    | "hs"
-                    | "lua"
-                    | "pl"
-                    | "pm"
-                    | "vim"
-            );
-        }
-
-        // Include files without extension (often config files) when using defaults
-        true
-    }
-
-    /// Check if a file is a text file (UTF-8 encoded, non-binary)
-    fn is_text_file(path: &Path, max_size: u64) -> bool {
-        // Check file size first to avoid reading large files
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.len() > max_size {
-                return false;
-            }
-        } else {
             return false;
         }
 
-        // Quick check: if it has a known text file extension, assume it's text
-        // This avoids unnecessary file reading for common text files
-        if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-            let ext = extension.to_lowercase();
-            if matches!(
-                ext.as_str(),
-                "txt" | "md" | "markdown" | "rst" | "json" | "xml" | "yaml" | "yml" 
-                | "toml" | "ini" | "conf" | "cfg" | "log" | "csv" | "tsv"
-                | "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "html" | "css" | "scss"
-                | "c" | "cpp" | "h" | "hpp" | "java" | "kt" | "go" | "rb" | "php"
-                | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "dockerfile"
-                | "vue" | "svelte" | "sass" | "less" | "tex" | "sql" | "r"
-                | "swift" | "scala" | "clj" | "elm" | "hs" | "lua" | "pl" | "pm" | "vim"
-            ) {
-                return true;
+        // Use default text file extensions
+        Self::has_text_extension(path)
+    }
+
+    /// Check if extension matches any of the patterns.
+    fn extension_matches(ext: &OsStr, patterns: &[String]) -> bool {
+        if let Some(ext_str) = ext.to_str() {
+            for pattern in patterns {
+                if pattern.starts_with("*.") {
+                    if ext_str.eq_ignore_ascii_case(&pattern[2..]) {
+                        return true;
+                    }
+                } else if ext_str.eq_ignore_ascii_case(pattern) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if file has a common text extension.
+    fn has_text_extension(path: &Path) -> bool {
+        if let Some(extension) = path.extension() {
+            if let Some(ext_str) = extension.to_str() {
+                return Self::is_known_text_extension(ext_str);
             }
         }
 
-        // For files without known text extensions or unknown extensions,
-        // read a small sample to detect if it's binary
-        const SAMPLE_SIZE: usize = 8192; // Read first 8KB
-        
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                // If file is empty, consider it text
-                if bytes.is_empty() {
-                    return true;
-                }
-
-                // Take a sample from the beginning of the file
-                let sample = if bytes.len() <= SAMPLE_SIZE {
-                    &bytes
-                } else {
-                    &bytes[..SAMPLE_SIZE]
-                };
-
-                // Check for null bytes (common indicator of binary files)
-                if sample.contains(&0) {
-                    return false;
-                }
-
-                // Try to decode as UTF-8
-                match std::str::from_utf8(sample) {
-                    Ok(_) => {
-                        // If it's valid UTF-8, check if it contains mostly printable characters
-                        Self::is_mostly_printable(sample)
-                    }
-                    Err(_) => {
-                        // If it's not valid UTF-8, it's likely binary
-                        false
-                    }
-                }
-            }
-            Err(_) => false, // If we can't read the file, skip it
+        // Check extensionless files
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+            Self::is_extensionless_text_file(filename)
+        } else {
+            false
         }
     }
 
-    /// Check if the byte content contains mostly printable characters
-    fn is_mostly_printable(bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
+    /// Check extension by length for faster matching.
+    #[inline]
+    fn is_known_text_extension(ext: &str) -> bool {
+        match ext.len() {
+            1 => matches!(ext, "c" | "h" | "r"),
+            2 => matches!(ext, "rs" | "py" | "js" | "ts" | "go" | "rb" | "md"),
+            3 => matches!(ext, "txt" | "cpp" | "hpp" | "php" | "css" | "xml" | "yml" | "sql" | "tex" | "asm" | "vim" | "cfg" | "ini"),
+            4 => matches!(ext, "java" | "html" | "json" | "yaml" | "toml" | "bash"),
+            _ => matches!(ext, "gitignore" | "dockerfile" | "makefile"),
+        }
+    }
+
+    /// Fast extensionless file check.
+    #[inline]
+    fn is_extensionless_text_file(filename: &str) -> bool {
+        matches!(filename.to_ascii_lowercase().as_str(),
+            "makefile" | "dockerfile" | "readme" | "license" | "changelog" |
+            "manifest" | "requirements" | "todo" | "authors" | "copying"
+        )
+    }
+
+    /// Check if file is a lock file.
+    fn is_lock_file(path: &Path) -> bool {
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+            // Check suffix patterns first
+            if filename.ends_with(".lock") || filename.ends_with("-lock") {
+                return true;
+            }
+            
+            // Check known lock file names
+            matches!(filename,
+                "Cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" |
+                "composer.lock" | "poetry.lock" | "Pipfile.lock" | "Gemfile.lock" |
+                "mix.lock" | "go.sum" | "flake.lock" | "deno.lock"
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Check if file contains text content.
+    fn is_text_file(path: &Path) -> bool {
+        // Trust known text extensions immediately
+        if Self::has_text_extension(path) {
             return true;
         }
 
-        let mut printable_count = 0;
-        let mut total_count = 0;
+        // Check file content for unknown extensions
+        Self::is_text_content(path)
+    }
 
-        for &byte in bytes {
-            total_count += 1;
-            
-            // Consider printable: ASCII printable chars and whitespace
-            // Note: is_ascii_whitespace() already covers \t, \n, \r and more
-            // Note: is_ascii_graphic() covers 0x21-0x7E, which overlaps with 0x20-0x7E
-            if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
-                printable_count += 1;
+    /// Check if file content is text using memory mapping.
+    fn is_text_content(path: &Path) -> bool {
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                match unsafe { memmap2::Mmap::map(&file) } {
+                    Ok(mmap) => {
+                        if mmap.is_empty() {
+                            return true;
+                        }
+                        
+                        // Check only first 128 bytes for speed
+                        let check_size = mmap.len().min(128);
+                        let bytes = &mmap[..check_size];
+                        
+                        // Check for binary content
+                        !bytes.iter().any(|&b| b == 0 || (b < 32 && !matches!(b, 9 | 10 | 13)))
+                    }
+                    Err(_) => false,
+                }
             }
+            Err(_) => false,
         }
+    }
 
-        // If at least 85% of characters are printable, consider it text
-        let printable_ratio = printable_count as f64 / total_count as f64;
-        printable_ratio >= 0.85
+    /// Create file entry with minimal allocations.
+    fn create_file_entry(path: PathBuf, metadata: Metadata) -> FileEntry {
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        FileEntry {
+            path,
+            filename,
+            size: metadata.len(),
+            modified: metadata.modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            content: String::new(), // Content loaded separately
+            mime_type: String::new(),
+            encoding: String::new(),
+            hash: String::new(),
+        }
+    }
+
+    /// Load file content using memory mapping for speed.
+    pub fn load_file_content(path: &Path, max_size: u64) -> Result<String> {
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        
+        if metadata.len() > max_size {
+            return Err(anyhow::anyhow!("File too large: {} bytes", metadata.len()));
+        }
+        
+        if metadata.len() == 0 {
+            return Ok(String::new());
+        }
+        
+        let mmap = unsafe { Mmap::map(&file)? };
+        match std::str::from_utf8(&mmap) {
+            Ok(content) => Ok(content.to_string()),
+            Err(_) => Err(anyhow::anyhow!("File is not valid UTF-8")),
+        }
     }
 }

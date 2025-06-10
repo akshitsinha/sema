@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::types::{AppState, CrawlerConfig, FileEntry};
+use crate::storage::service::ProcessingService;
+use crate::types::{AppState, CrawlerConfig, FileEntry, ChunkConfig};
 
 // Import our new modular components
 use super::components::{ColorManager, FileListRenderer, SearchInputRenderer};
@@ -33,6 +34,11 @@ pub struct SharedAppState {
     pub crawled_files: Vec<FileEntry>,
     pub state: AppState,
     pub data_changed: bool, // Flag to track when data has changed
+    pub chunks_created: usize,
+    pub crawling_start_time: Option<std::time::Instant>,
+    pub chunking_start_time: Option<std::time::Instant>,
+    pub crawling_duration: Option<std::time::Duration>,
+    pub chunking_duration: Option<std::time::Duration>,
 }
 
 pub struct App {
@@ -60,6 +66,11 @@ impl App {
                 crawled_files: Vec::new(),
                 state: AppState::Crawling,
                 data_changed: false,
+                chunks_created: 0,
+                crawling_start_time: Some(std::time::Instant::now()),
+                chunking_start_time: None,
+                crawling_duration: None,
+                chunking_duration: None,
             })),
             crawler_handle: None,
             crawler_config,
@@ -111,16 +122,27 @@ impl App {
         let crawler = FileCrawler::new(self.crawler_config.clone());
         let root_path = self.root_path.clone();
         let shared_state_for_completion = Arc::clone(&self.shared_state);
+        let max_file_size = self.crawler_config.max_file_size;
 
         // Spawn crawler task
         let crawler_handle = tokio::spawn(async move {
             let result = crawler.crawl_directory(&root_path, file_tx).await;
 
-            // Mark crawling as complete when done
-            {
-                let mut shared = shared_state_for_completion.lock().unwrap();
-                shared.state = AppState::Ready;
-                shared.data_changed = true;
+            // When crawling is done, start chunking
+            if result.is_ok() {
+                {
+                    let mut shared = shared_state_for_completion.lock().unwrap();
+                    // Record crawling completion time
+                    if let Some(start_time) = shared.crawling_start_time {
+                        shared.crawling_duration = Some(start_time.elapsed());
+                    }
+                    shared.state = AppState::Chunking;
+                    shared.chunking_start_time = Some(std::time::Instant::now());
+                    shared.data_changed = true;
+                }
+
+                // Start chunking process
+                Self::start_chunking_process(shared_state_for_completion, max_file_size).await;
             }
 
             result
@@ -164,17 +186,17 @@ impl App {
                 let mut shared = self.shared_state.lock().unwrap();
                 let state = shared.state.clone();
                 if shared.data_changed {
-                    shared.data_changed = false; // Reset flag
+                    shared.data_changed = false;
                     needs_redraw = true;
                 }
                 state
             };
 
-            let timeout = if current_state == AppState::Crawling {
-                // When crawling, check for events more frequently for spinner updates
+            let timeout = if matches!(current_state, AppState::Crawling | AppState::Chunking) {
+                // When processing, check for events more frequently for spinner updates
                 Duration::from_millis(100)
             } else {
-                // When idle, wait longer to reduce CPU usage
+                // When ready, wait longer to reduce CPU usage
                 Duration::from_millis(500)
             };
 
@@ -199,30 +221,23 @@ impl App {
                                 shared.crawled_files.len()
                             };
 
-                            // Handle the restart case separately to avoid borrow issues
-                            let should_restart = matches!(key.code, KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) && current_state == AppState::Ready);
-
-                            if should_restart {
-                                self.restart_crawler().await?;
-                            } else {
-                                KeyboardHandler::handle_normal_mode_key(
-                                    &key,
-                                    &mut self.should_quit,
-                                    &mut self.search_mode,
-                                    &mut self.selected_file_index,
-                                    &mut self.file_list_scroll_offset,
-                                    get_total_count,
-                                    &current_state,
-                                )
-                                .await?;
-                            }
+                            KeyboardHandler::handle_normal_mode_key(
+                                &key,
+                                &mut self.should_quit,
+                                &mut self.search_mode,
+                                &mut self.selected_file_index,
+                                &mut self.file_list_scroll_offset,
+                                get_total_count,
+                                &current_state,
+                            )
+                            .await?;
                         }
                     }
                 }
             }
 
-            // Update spinner animation only when crawling and enough time has passed
-            if current_state == AppState::Crawling
+            // Update spinner animation only when processing and enough time has passed
+            if matches!(current_state, AppState::Crawling | AppState::Chunking)
                 && last_tick.elapsed() >= Duration::from_millis(100)
             {
                 self.spinner_frame = (self.spinner_frame + 1) % 8;
@@ -243,23 +258,52 @@ impl App {
         Ok(())
     }
 
-    async fn restart_crawler(&mut self) -> Result<()> {
-        // Clean up existing crawler
-        if let Some(handle) = self.crawler_handle.take() {
-            handle.abort();
+    async fn start_chunking_process(shared_state: Arc<Mutex<SharedAppState>>, max_file_size: u64) {
+        // Get the list of files to process
+        let files = {
+            let shared = shared_state.lock().unwrap();
+            shared.crawled_files.clone()
+        };
+
+        // Get config directory for database
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .join("sema");
+
+        // Initialize processing service
+        let processing_service = match ProcessingService::new(&config_dir, ChunkConfig::default()).await {
+            Ok(service) => service,
+            Err(e) => {
+                eprintln!("Failed to initialize processing service: {}", e);
+                let mut shared = shared_state.lock().unwrap();
+                shared.state = AppState::Ready;
+                shared.data_changed = true;
+                return;
+            }
+        };
+
+        // Process files with incremental processing (only modified/new files)
+        match processing_service.process_files_parallel(files, max_file_size).await {
+            Ok(stats) => {
+                let mut shared = shared_state.lock().unwrap();
+                shared.chunks_created = stats.chunks_created;
+                // Record chunking completion time
+                if let Some(start_time) = shared.chunking_start_time {
+                    shared.chunking_duration = Some(start_time.elapsed());
+                }
+                shared.state = AppState::Ready;
+                shared.data_changed = true;
+            }
+            Err(e) => {
+                eprintln!("Failed to process files in parallel: {}", e);
+                let mut shared = shared_state.lock().unwrap();
+                shared.state = AppState::Ready;
+                shared.data_changed = true;
+            }
         }
 
-        // Reset state and scroll
-        {
-            let mut shared = self.shared_state.lock().unwrap();
-            shared.crawled_files.clear();
-            shared.data_changed = false;
-        }
-        self.file_list_scroll_offset = 0;
-        self.selected_file_index = 0;
-
-        // Start new crawler
-        self.start_crawler().await
+        // Close the processing service
+        processing_service.close().await;
     }
 
     fn ui(&self, f: &mut Frame) {
@@ -278,15 +322,15 @@ impl App {
 
         // Main content based on state - use the full area
         match state {
-            AppState::Crawling | AppState::Ready => self.render_ready(f, area, &files),
+            AppState::Crawling | AppState::Chunking | AppState::Ready => self.render_ready(f, area, &files),
         }
     }
 
     fn render_ready(&self, f: &mut Frame, area: Rect, files: &[FileEntry]) {
-        // Get current state for display
-        let state = {
+        // Get current state and timing information for display
+        let (state, chunks_created, crawling_duration, chunking_duration) = {
             let shared = self.shared_state.lock().unwrap();
-            shared.state.clone()
+            (shared.state.clone(), shared.chunks_created, shared.crawling_duration, shared.chunking_duration)
         };
 
         // Convert files to the format expected by FileListRenderer
@@ -322,6 +366,9 @@ impl App {
             files.len(),
             &state,
             spinner_char,
+            chunks_created,
+            crawling_duration,
+            chunking_duration,
         );
     }
 }

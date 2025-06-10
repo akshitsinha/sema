@@ -30,6 +30,73 @@ impl Default for FileEntry {
     }
 }
 
+/// Represents a text chunk from a file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextChunk {
+    pub id: Option<i64>,
+    pub file_path: PathBuf,
+    pub file_name: String,
+    pub chunk_index: usize,
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content_hash: String,
+    pub file_modified_time: SystemTime,
+}
+
+impl TextChunk {
+    pub fn new(
+        file_path: PathBuf,
+        chunk_index: usize,
+        content: String,
+        start_line: usize,
+        end_line: usize,
+        _language: Option<String>, // Keep for backwards compatibility but don't use
+        file_modified_time: SystemTime,
+    ) -> Self {
+        // Use BLAKE3 for fast hashing
+        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        Self {
+            id: None,
+            file_path,
+            file_name,
+            chunk_index,
+            content,
+            start_line,
+            end_line,
+            content_hash,
+            file_modified_time,
+        }
+    }
+}
+
+/// Configuration for text chunking
+#[derive(Debug, Clone)]
+pub struct ChunkConfig {
+    pub max_chunk_size: usize,
+    pub overlap_size: usize,
+    pub respect_line_boundaries: bool,
+    pub respect_function_boundaries: bool,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_size: 1000,  // characters
+            overlap_size: 200,     // characters
+            respect_line_boundaries: true,
+            respect_function_boundaries: true,
+        }
+    }
+}
+
 /// Configuration for the file crawler
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlerConfig {
@@ -39,6 +106,7 @@ pub struct CrawlerConfig {
     pub file_extensions: Vec<String>,
     pub exclude_patterns: Vec<String>,
     pub ignore_gitignore: bool,
+    pub ignore_lock_files: bool,
 }
 
 impl Default for CrawlerConfig {
@@ -73,6 +141,7 @@ impl Default for CrawlerConfig {
                 "*.log".to_string(),
             ],
             ignore_gitignore: true,
+            ignore_lock_files: true,
         }
     }
 }
@@ -86,6 +155,7 @@ impl From<&crate::config::GeneralConfig> for CrawlerConfig {
             file_extensions: general_config.file_extensions.clone(),
             exclude_patterns: general_config.exclude_patterns.clone(),
             ignore_gitignore: general_config.ignore_gitignore,
+            ignore_lock_files: general_config.ignore_lock_files,
         }
     }
 }
@@ -94,5 +164,6 @@ impl From<&crate::config::GeneralConfig> for CrawlerConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
     Crawling,
+    Chunking,
     Ready,
 }

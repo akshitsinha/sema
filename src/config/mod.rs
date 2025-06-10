@@ -30,6 +30,8 @@ pub struct GeneralConfig {
     pub include_hidden: bool,
     /// Whether to ignore files listed in .gitignore files
     pub ignore_gitignore: bool,
+    /// Whether to ignore common lock files (package-lock.json, Cargo.lock, etc.)
+    pub ignore_lock_files: bool,
 }
 
 /// Qdrant vector database configuration
@@ -125,6 +127,7 @@ impl Default for GeneralConfig {
             follow_symlinks: false,
             include_hidden: false,
             ignore_gitignore: true,
+            ignore_lock_files: true,
         }
     }
 }

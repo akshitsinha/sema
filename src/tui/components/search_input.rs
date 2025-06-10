@@ -1,4 +1,4 @@
-use crate::types::AppState;
+use crate::types::{AppState};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -18,6 +18,9 @@ impl SearchInputRenderer {
         total_files: usize,
         state: &AppState,
         spinner_char: &str,
+        chunks_created: usize,
+        crawling_duration: Option<std::time::Duration>,
+        chunking_duration: Option<std::time::Duration>,
     ) {
         let search_color = if search_mode {
             Color::Magenta // Purple when active
@@ -30,8 +33,26 @@ impl SearchInputRenderer {
             AppState::Crawling => {
                 format!(" {} Indexing... ", spinner_char)
             }
+            AppState::Chunking => {
+                if let Some(duration) = crawling_duration {
+                    format!(" {} files crawled in {:.1}s {} Chunking ", 
+                           total_files, 
+                           duration.as_secs_f64(), 
+                           spinner_char)
+                } else {
+                    format!(" {} Chunking ", spinner_char)
+                }
+            }
             AppState::Ready => {
-                format!(" {} ", total_files)
+                if chunks_created > 0 {
+                    if let Some(duration) = chunking_duration {
+                        format!(" {} chunks processed in {:.1}s ", chunks_created, duration.as_secs_f64())
+                    } else {
+                        format!(" Chunked {} ", chunks_created)
+                    }
+                } else {
+                    format!(" {} files ", total_files)
+                }
             }
         };
 
