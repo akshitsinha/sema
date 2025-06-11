@@ -18,9 +18,6 @@ impl SearchInputRenderer {
         total_files: usize,
         state: &AppState,
         spinner_char: &str,
-        chunks_created: usize,
-        crawling_duration: Option<std::time::Duration>,
-        chunking_duration: Option<std::time::Duration>,
     ) {
         let search_color = if search_mode {
             Color::Magenta // Purple when active
@@ -31,32 +28,17 @@ impl SearchInputRenderer {
         // Generate title based on indexing state and file count
         let title = match state {
             AppState::Crawling => {
-                format!(" {} Indexing... ", spinner_char)
+                format!(" {} Crawling files... ", spinner_char)
             }
             AppState::Chunking => {
-                if let Some(duration) = crawling_duration {
-                    format!(" {} files crawled in {:.1}s {} Chunking ", 
-                           total_files, 
-                           duration.as_secs_f64(), 
-                           spinner_char)
-                } else {
-                    format!(" {} Chunking ", spinner_char)
-                }
+                format!(" {} Processing files... ", spinner_char)
             }
             AppState::Ready => {
-                if chunks_created > 0 {
-                    if let Some(duration) = chunking_duration {
-                        format!(" {} chunks processed in {:.1}s ", chunks_created, duration.as_secs_f64())
-                    } else {
-                        format!(" Chunked {} ", chunks_created)
-                    }
-                } else {
-                    format!(" {} files ", total_files)
-                }
+                format!(" {} files indexed ", total_files)
             }
         };
 
-        let search_block = Block::default()
+                let search_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(search_color))

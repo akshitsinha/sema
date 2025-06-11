@@ -35,12 +35,10 @@ impl Default for FileEntry {
 pub struct TextChunk {
     pub id: Option<i64>,
     pub file_path: PathBuf,
-    pub file_name: String,
     pub chunk_index: usize,
     pub content: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub content_hash: String,
     pub file_modified_time: SystemTime,
 }
 
@@ -51,26 +49,16 @@ impl TextChunk {
         content: String,
         start_line: usize,
         end_line: usize,
-        _language: Option<String>, // Keep for backwards compatibility but don't use
+        _language: Option<String>,
         file_modified_time: SystemTime,
     ) -> Self {
-        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-        
-        let file_name = file_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| String::from("unknown"));
-
         Self {
             id: None,
             file_path,
-            file_name,
             chunk_index,
             content,
             start_line,
             end_line,
-            content_hash,
             file_modified_time,
         }
     }

@@ -1,8 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,32 +13,36 @@ use ratatui::{
 };
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
 use crate::storage::service::ProcessingService;
-use crate::types::{AppState, CrawlerConfig, FileEntry, ChunkConfig};
+use crate::types::{ChunkConfig, CrawlerConfig, FileEntry};
 
 use super::components::{ColorManager, FileListRenderer, SearchInputRenderer};
 use super::handlers::KeyboardHandler;
 use super::utils::SpinnerUtils;
 
 #[derive(Clone)]
-pub struct SharedAppState {
+pub struct AppStateData {
     pub crawled_files: Vec<FileEntry>,
-    pub state: AppState,
-    pub data_changed: bool,
-    pub chunks_created: usize,
-    pub crawling_duration: Option<std::time::Duration>,
-    pub chunking_duration: Option<std::time::Duration>,
+    pub state: crate::types::AppState,
+}
+
+#[derive(Debug)]
+pub enum StateUpdate {
+    FileFound(FileEntry),
+    StateChanged(crate::types::AppState),
+    AllFilesCollected(Vec<FileEntry>),
 }
 
 pub struct App {
     should_quit: bool,
-    shared_state: Arc<Mutex<SharedAppState>>,
+    app_state: AppStateData,
+    state_rx: mpsc::UnboundedReceiver<StateUpdate>,
+    state_tx: mpsc::UnboundedSender<StateUpdate>,
     crawler_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     crawler_config: CrawlerConfig,
     root_path: PathBuf,
@@ -50,22 +52,22 @@ pub struct App {
     search_input: String,
     search_mode: bool,
     color_manager: ColorManager,
+    data_changed: bool,
 }
 
 impl App {
     pub fn new_with_directory(directory: PathBuf, config: Config) -> Result<Self> {
         let crawler_config = CrawlerConfig::from(&config.general);
+        let (state_tx, state_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             should_quit: false,
-            shared_state: Arc::new(Mutex::new(SharedAppState {
+            app_state: AppStateData {
                 crawled_files: Vec::new(),
-                state: AppState::Crawling,
-                data_changed: false,
-                chunks_created: 0,
-                crawling_duration: None,
-                chunking_duration: None,
-            })),
+                state: crate::types::AppState::Crawling,
+            },
+            state_rx,
+            state_tx,
             crawler_handle: None,
             crawler_config,
             root_path: directory,
@@ -75,6 +77,7 @@ impl App {
             search_input: String::new(),
             search_mode: true,
             color_manager: ColorManager::new(),
+            data_changed: false,
         })
     }
 
@@ -101,47 +104,37 @@ impl App {
     }
 
     async fn start_crawler(&mut self) -> Result<()> {
-        {
-            let mut shared = self.shared_state.lock().unwrap();
-            shared.state = AppState::Crawling;
-        }
+        let _ = self
+            .state_tx
+            .send(StateUpdate::StateChanged(crate::types::AppState::Crawling));
 
         let (file_tx, mut file_rx) = mpsc::unbounded_channel();
         let crawler = FileCrawler::new(self.crawler_config.clone());
         let root_path = self.root_path.clone();
-        let shared_state_for_completion = Arc::clone(&self.shared_state);
-        let max_file_size = self.crawler_config.max_file_size;
+        let state_tx = self.state_tx.clone();
 
         let crawler_handle = tokio::spawn(async move {
-            let crawl_start = std::time::Instant::now();
             let result = crawler.crawl_directory(&root_path, file_tx).await;
-
             if result.is_ok() {
-                {
-                    let mut shared = shared_state_for_completion.lock().unwrap();
-                    shared.crawling_duration = Some(crawl_start.elapsed());
-                    shared.state = AppState::Chunking;
-                    shared.data_changed = true;
-                }
-
-                Self::start_chunking_process(shared_state_for_completion, max_file_size).await;
+                let _ = state_tx.send(StateUpdate::StateChanged(crate::types::AppState::Chunking));
             }
-
             result
         });
 
         self.crawler_handle = Some(crawler_handle);
 
-        let shared_state_clone = Arc::clone(&self.shared_state);
-        let file_handle = tokio::spawn(async move {
+        let state_tx = self.state_tx.clone();
+        tokio::spawn(async move {
+            let mut collected_files = Vec::new();
             while let Some(file_entry) = file_rx.recv().await {
-                let mut shared = shared_state_clone.lock().unwrap();
-                shared.crawled_files.push(file_entry);
-                shared.data_changed = true;
+                let _ = state_tx.send(StateUpdate::FileFound(file_entry.clone()));
+                collected_files.push(file_entry);
+            }
+            if !collected_files.is_empty() {
+                let _ = state_tx.send(StateUpdate::AllFilesCollected(collected_files));
             }
         });
 
-        tokio::spawn(file_handle);
         Ok(())
     }
 
@@ -153,20 +146,37 @@ impl App {
         let mut needs_redraw = true;
 
         loop {
+            while let Ok(update) = self.state_rx.try_recv() {
+                match update {
+                    StateUpdate::FileFound(file) => {
+                        self.app_state.crawled_files.push(file);
+                        self.data_changed = true;
+                    }
+                    StateUpdate::StateChanged(new_state) => {
+                        self.app_state.state = new_state;
+                        self.data_changed = true;
+                    }
+                    StateUpdate::AllFilesCollected(files) => {
+                        let state_tx = self.state_tx.clone();
+                        let max_file_size = self.crawler_config.max_file_size;
+                        tokio::spawn(async move {
+                            Self::start_chunking(state_tx, files, max_file_size).await;
+                        });
+                    }
+                }
+            }
+
+            if self.data_changed {
+                needs_redraw = true;
+                self.data_changed = false;
+            }
+
             if needs_redraw {
                 terminal.draw(|f| self.ui(f))?;
                 needs_redraw = false;
             }
 
-            let current_state = {
-                let mut shared = self.shared_state.lock().unwrap();
-                let state = shared.state.clone();
-                if shared.data_changed {
-                    shared.data_changed = false;
-                    needs_redraw = true;
-                }
-                state
-            };
+            let current_state = self.app_state.state.clone();
 
             if crossterm::event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
@@ -184,10 +194,7 @@ impl App {
                             )
                             .await;
                         } else {
-                            let get_total_count = || {
-                                let shared = self.shared_state.lock().unwrap();
-                                shared.crawled_files.len()
-                            };
+                            let get_total_count = || self.app_state.crawled_files.len();
 
                             KeyboardHandler::handle_normal_mode_key(
                                 &key,
@@ -204,9 +211,10 @@ impl App {
                 }
             }
 
-            // Update spinner animation only when processing and enough time has passed
-            if matches!(current_state, AppState::Crawling | AppState::Chunking)
-                && last_tick.elapsed() >= Duration::from_millis(100)
+            if matches!(
+                current_state,
+                crate::types::AppState::Crawling | crate::types::AppState::Chunking
+            ) && last_tick.elapsed() >= Duration::from_millis(100)
             {
                 self.spinner_frame = (self.spinner_frame + 1) % 8;
                 needs_redraw = true;
@@ -218,7 +226,6 @@ impl App {
             }
         }
 
-        // Clean up crawler if running
         if let Some(handle) = self.crawler_handle.take() {
             handle.abort();
         }
@@ -226,41 +233,32 @@ impl App {
         Ok(())
     }
 
-    async fn start_chunking_process(shared_state: Arc<Mutex<SharedAppState>>, max_file_size: u64) {
-        let files = {
-            let shared = shared_state.lock().unwrap();
-            shared.crawled_files.clone()
-        };
-
+    async fn start_chunking(
+        state_tx: mpsc::UnboundedSender<StateUpdate>,
+        files: Vec<FileEntry>,
+        max_file_size: u64,
+    ) {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .join("sema");
 
-        let processing_service = match ProcessingService::new(&config_dir, ChunkConfig::default()).await {
-            Ok(service) => service,
-            Err(e) => {
-                eprintln!("Failed to initialize processing service: {}", e);
-                let mut shared = shared_state.lock().unwrap();
-                shared.state = AppState::Ready;
-                shared.data_changed = true;
-                return;
-            }
-        };
+        let processing_service =
+            match ProcessingService::new(&config_dir, ChunkConfig::default()).await {
+                Ok(service) => service,
+                Err(e) => {
+                    eprintln!("Failed to initialize processing service: {}", e);
+                    let _ = state_tx.send(StateUpdate::StateChanged(crate::types::AppState::Ready));
+                    return;
+                }
+            };
 
-        let chunk_start = std::time::Instant::now();
-        match processing_service.process_files_parallel(files, max_file_size).await {
-            Ok(stats) => {
-                let mut shared = shared_state.lock().unwrap();
-                shared.chunks_created = stats.chunks_created;
-                shared.chunking_duration = Some(chunk_start.elapsed());
-                shared.state = AppState::Ready;
-                shared.data_changed = true;
+        match processing_service.process_files(files, max_file_size).await {
+            Ok(()) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(crate::types::AppState::Ready));
             }
             Err(e) => {
-                eprintln!("Failed to process files in parallel: {}", e);
-                let mut shared = shared_state.lock().unwrap();
-                shared.state = AppState::Ready;
-                shared.data_changed = true;
+                eprintln!("Failed to process files: {}", e);
+                let _ = state_tx.send(StateUpdate::StateChanged(crate::types::AppState::Ready));
             }
         }
 
@@ -268,34 +266,28 @@ impl App {
     }
 
     fn ui(&self, f: &mut Frame) {
-        let (state, files) = {
-            let shared = self.shared_state.lock().unwrap();
-            (shared.state.clone(), shared.crawled_files.clone())
-        };
+        let state = self.app_state.state.clone();
+        let files = &self.app_state.crawled_files;
 
         let area = f.area();
         let background = Block::default().style(Style::default().bg(Color::Reset));
         f.render_widget(background, area);
 
         match state {
-            AppState::Crawling | AppState::Chunking | AppState::Ready => self.render_ready(f, area, &files),
+            crate::types::AppState::Crawling
+            | crate::types::AppState::Chunking
+            | crate::types::AppState::Ready => self.render_ready(f, area, files),
         }
     }
 
     fn render_ready(&self, f: &mut Frame, area: Rect, files: &[FileEntry]) {
-        let (state, chunks_created, crawling_duration, chunking_duration) = {
-            let shared = self.shared_state.lock().unwrap();
-            (shared.state.clone(), shared.chunks_created, shared.crawling_duration, shared.chunking_duration)
-        };
+        let state = self.app_state.state.clone();
 
         let file_refs: Vec<&FileEntry> = files.iter().collect();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(3),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
 
         FileListRenderer::render(
@@ -317,9 +309,6 @@ impl App {
             files.len(),
             &state,
             spinner_char,
-            chunks_created,
-            crawling_duration,
-            chunking_duration,
         );
     }
 }
