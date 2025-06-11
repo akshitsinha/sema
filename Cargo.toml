@@ -23,7 +23,6 @@ mime = "0.3.17"
 ignore = "0.4.23"
 sha2 = "0.10.9"
 num_cpus = "1.17.0"
-memmap2 = "0.9.5"  # Ultra-fast memory-mapped file reading
 
 # Text processing
 regex = "1.11.1"

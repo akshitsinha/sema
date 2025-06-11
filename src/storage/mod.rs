@@ -259,6 +259,41 @@ impl ChunkStorage {
         Ok(chunks)
     }
 
+    /// Get all chunks for embedding processing with memory-efficient streaming
+    pub async fn get_all_chunks_streaming<F>(&self, mut chunk_processor: F) -> Result<()>
+    where
+        F: FnMut(TextChunk) -> Result<()>,
+    {
+        let mut stream = sqlx::query(
+            "SELECT id, file_path, file_name, chunk_index, content, start_line, end_line, content_hash, file_modified_time 
+             FROM chunks ORDER BY file_path, chunk_index"
+        )
+        .fetch(&self.pool);
+
+        use futures::TryStreamExt;
+        
+        while let Some(row) = stream.try_next().await? {
+            let modified_time_timestamp = row.get::<i64, _>("file_modified_time");
+            let file_modified_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_time_timestamp as u64);
+            
+            let chunk = TextChunk {
+                id: Some(row.get("id")),
+                file_path: PathBuf::from(row.get::<String, _>("file_path")),
+                file_name: row.get("file_name"),
+                chunk_index: row.get::<i64, _>("chunk_index") as usize,
+                content: row.get("content"),
+                start_line: row.get::<i64, _>("start_line") as usize,
+                end_line: row.get::<i64, _>("end_line") as usize,
+                content_hash: row.get("content_hash"),
+                file_modified_time,
+            };
+            
+            chunk_processor(chunk)?;
+        }
+
+        Ok(())
+    }
+
     /// Get chunks by content hash (useful for deduplication)
     pub async fn get_chunk_by_hash(&self, content_hash: &str) -> Result<Option<TextChunk>> {
         let row = sqlx::query(

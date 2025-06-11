@@ -54,14 +54,13 @@ impl TextChunk {
         _language: Option<String>, // Keep for backwards compatibility but don't use
         file_modified_time: SystemTime,
     ) -> Self {
-        // Use BLAKE3 for fast hashing
         let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
         
         let file_name = file_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| String::from("unknown"));
 
         Self {
             id: None,
@@ -89,8 +88,8 @@ pub struct ChunkConfig {
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            max_chunk_size: 1000,  // characters
-            overlap_size: 200,     // characters
+            max_chunk_size: 1000,
+            overlap_size: 200,
             respect_line_boundaries: true,
             respect_function_boundaries: true,
         }

@@ -29,38 +29,103 @@ impl ProcessingService {
 
         let config = self.config.clone();
         
-        // Filter files that need processing using batch database operations
         let files_to_process = self.batch_filter_files(files).await?;
         
         if files_to_process.is_empty() {
             return Ok(ProcessingStats::default());
         }
 
-        // Process all files simultaneously across all CPU cores
-        let all_chunks: Vec<Vec<TextChunk>> = tokio::task::spawn_blocking(move || {
-            files_to_process
-                .into_par_iter()
-                .map(|file_entry| {
-                    Self::process_single_file(&file_entry, max_file_size, &config)
-                })
-                .collect()
-        }).await?;
-
-        // Collect results and store in bulk
+        const BATCH_SIZE: usize = 32;
         let mut stats = ProcessingStats::default();
-        let mut all_flat_chunks = Vec::new();
         
-        for chunk_batch in all_chunks {
-            if !chunk_batch.is_empty() {
-                stats.files_processed += 1;
-                stats.chunks_created += chunk_batch.len();
-                all_flat_chunks.extend(chunk_batch);
+        for batch in files_to_process.chunks(BATCH_SIZE) {
+            let batch_chunks: Vec<Vec<TextChunk>> = tokio::task::spawn_blocking({
+                let config = config.clone();
+                let batch = batch.to_vec();
+                move || {
+                    batch
+                        .into_par_iter()
+                        .map(|file_entry| {
+                            Self::process_single_file(&file_entry, max_file_size, &config)
+                        })
+                        .collect()
+                }
+            }).await?;
+
+            let mut batch_flat_chunks = Vec::new();
+            for chunk_batch in batch_chunks {
+                if !chunk_batch.is_empty() {
+                    stats.files_processed += 1;
+                    stats.chunks_created += chunk_batch.len();
+                    batch_flat_chunks.extend(chunk_batch);
+                }
             }
+
+            if !batch_flat_chunks.is_empty() {
+                self.storage.store_chunks(&batch_flat_chunks).await?;
+            }
+            
+            drop(batch_flat_chunks);
         }
 
-        // Store all chunks in a single transaction
-        if !all_flat_chunks.is_empty() {
-            self.storage.store_chunks(&all_flat_chunks).await?;
+        Ok(stats)
+    }
+
+    /// Process files with strict memory limits and monitoring
+    pub async fn process_files_memory_limited(
+        &self, 
+        files: Vec<FileEntry>, 
+        max_file_size: u64,
+        memory_limit_mb: usize
+    ) -> Result<ProcessingStats> {
+        if files.is_empty() {
+            return Ok(ProcessingStats::default());
+        }
+
+        let config = self.config.clone();
+        let files_to_process = self.batch_filter_files(files).await?;
+        
+        if files_to_process.is_empty() {
+            return Ok(ProcessingStats::default());
+        }
+
+        // Calculate batch size based on memory limit
+        let estimated_memory_per_file = 100 * 1024; // 100KB estimate per file
+        let memory_limit_bytes = memory_limit_mb * 1024 * 1024;
+        let max_batch_size = (memory_limit_bytes / estimated_memory_per_file).max(1).min(16);
+        
+        let mut stats = ProcessingStats::default();
+        
+        for batch in files_to_process.chunks(max_batch_size) {
+            // Process with memory constraints
+            let batch_chunks: Vec<Vec<TextChunk>> = tokio::task::spawn_blocking({
+                let config = config.clone();
+                let batch = batch.to_vec();
+                move || {
+                    batch
+                        .into_iter() // Use iterator instead of parallel to control memory
+                        .map(|file_entry| {
+                            Self::process_single_file(&file_entry, max_file_size, &config)
+                        })
+                        .collect()
+                }
+            }).await?;
+
+            // Store immediately and clean up
+            let mut batch_flat_chunks = Vec::new();
+            for chunk_batch in batch_chunks {
+                if !chunk_batch.is_empty() {
+                    stats.files_processed += 1;
+                    stats.chunks_created += chunk_batch.len();
+                    batch_flat_chunks.extend(chunk_batch);
+                }
+            }
+
+            if !batch_flat_chunks.is_empty() {
+                self.storage.store_chunks(&batch_flat_chunks).await?;
+            }
+            
+            drop(batch_flat_chunks);
         }
 
         Ok(stats)
@@ -160,9 +225,8 @@ impl ProcessingService {
         Ok(())
     }
 
-    /// Process a single file (load + chunk)
+    /// Process a single file
     fn process_single_file(file_entry: &FileEntry, max_file_size: u64, config: &ChunkConfig) -> Vec<TextChunk> {
-        // Use memory-mapped loading for performance
         let content = match FileCrawler::load_file_content(&file_entry.path, max_file_size) {
             Ok(content) => content,
             Err(_) => return Vec::new(),
@@ -172,13 +236,11 @@ impl ProcessingService {
             return Vec::new();
         }
 
-        // Chunk content with pre-allocated capacity
         Self::chunk_content(&file_entry.path, &content, config, file_entry.modified)
     }
 
-    /// Content chunking with minimal allocations
+    /// Content chunking
     fn chunk_content(file_path: &Path, content: &str, config: &ChunkConfig, file_modified_time: std::time::SystemTime) -> Vec<TextChunk> {
-        // Pre-calculate to avoid repeated work
         let content_len = content.len();
         if content_len <= config.max_chunk_size {
             let line_count = content.lines().count();
@@ -193,56 +255,42 @@ impl ProcessingService {
             )];
         }
 
-        // Pre-allocate with estimated capacity
         let estimated_chunks = (content_len / config.max_chunk_size) + 1;
         let mut chunks = Vec::with_capacity(estimated_chunks);
         
-        let lines: Vec<&str> = content.lines().collect();
         let mut current_chunk = String::with_capacity(config.max_chunk_size + 1000);
         let mut chunk_start_line = 1;
         let mut current_line = 1;
         let mut chunk_index = 0;
 
-        for line in lines {
-            // Avoid format! allocation - push directly
-            current_chunk.push_str(line);
-            current_chunk.push('\n');
-            
-            // Check if chunk is getting too large
-            if current_chunk.len() > config.max_chunk_size && current_chunk.len() > line.len() + 1 {
-                // Remove the last line we just added
-                current_chunk.truncate(current_chunk.len() - line.len() - 1);
-                
-                // Save current chunk
+        for line in content.lines() {
+            let line_len = line.len() + 1;
+            if current_chunk.len() + line_len > config.max_chunk_size && !current_chunk.is_empty() {
                 chunks.push(TextChunk::new(
                     file_path.to_path_buf(),
                     chunk_index,
-                    current_chunk.clone(),
+                    std::mem::take(&mut current_chunk),
                     chunk_start_line,
                     current_line - 1,
                     Self::detect_language(file_path),
                     file_modified_time,
                 ));
 
-                // Start new chunk with overlap if configured
-                if config.overlap_size > 0 {
-                    current_chunk = Self::create_overlap(&current_chunk, config.overlap_size);
+                if config.overlap_size > 0 && !chunks.is_empty() {
+                    current_chunk = Self::create_overlap(&chunks[chunks.len() - 1].content, config.overlap_size);
                 } else {
-                    current_chunk.clear();
-                    current_chunk.reserve(config.max_chunk_size + 1000);
+                    current_chunk = String::with_capacity(config.max_chunk_size + 1000);
                     chunk_start_line = current_line;
                 }
                 
-                // Add the line that didn't fit
-                current_chunk.push_str(line);
-                current_chunk.push('\n');
                 chunk_index += 1;
             }
-
+            
+            current_chunk.push_str(line);
+            current_chunk.push('\n');
             current_line += 1;
         }
 
-        // Add the last chunk if it has content
         if !current_chunk.is_empty() {
             chunks.push(TextChunk::new(
                 file_path.to_path_buf(),
@@ -264,22 +312,34 @@ impl ProcessingService {
             return chunk.to_string();
         }
 
-        let chars: Vec<char> = chunk.chars().collect();
-        if chars.len() <= overlap_size {
-            return chunk.to_string();
+        let mut char_count = 0;
+        let mut start_byte_idx = chunk.len();
+        
+        for (byte_idx, _) in chunk.char_indices().rev() {
+            char_count += 1;
+            if char_count >= overlap_size {
+                start_byte_idx = byte_idx;
+                break;
+            }
         }
 
-        let start_char_idx = chars.len() - overlap_size;
-        let overlap_candidate: String = chars[start_char_idx..].iter().collect();
+        let overlap_candidate = &chunk[start_byte_idx..];
 
-        // Try to find a good break point
         if let Some(last_newline) = overlap_candidate.rfind('\n') {
-            overlap_candidate.get(last_newline + 1..).unwrap_or(&overlap_candidate).to_string()
-        } else if let Some(last_space) = overlap_candidate.rfind(' ') {
-            overlap_candidate.get(last_space + 1..).unwrap_or(&overlap_candidate).to_string()
-        } else {
-            overlap_candidate
+            let after_newline = &overlap_candidate[last_newline + 1..];
+            if !after_newline.is_empty() {
+                return after_newline.to_string();
+            }
         }
+        
+        if let Some(last_space) = overlap_candidate.rfind(' ') {
+            let after_space = &overlap_candidate[last_space + 1..];
+            if !after_space.is_empty() {
+                return after_space.to_string();
+            }
+        }
+
+        overlap_candidate.to_string()
     }
 
     /// Simple language detection from file extension

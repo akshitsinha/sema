@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::fs::{File, Metadata};
+use std::fs::Metadata;
 use std::ffi::OsStr;
-use memmap2::Mmap;
 use std::sync::Arc;
+use std::io::Read;
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
@@ -195,21 +195,19 @@ impl FileCrawler {
         Self::is_text_content(path)
     }
 
-    /// Check if file content is text using memory mapping.
+    /// Check if file content is text.
     fn is_text_content(path: &Path) -> bool {
         match std::fs::File::open(path) {
-            Ok(file) => {
-                match unsafe { memmap2::Mmap::map(&file) } {
-                    Ok(mmap) => {
-                        if mmap.is_empty() {
+            Ok(mut file) => {
+                let mut buffer = [0u8; 128];
+                match file.read(&mut buffer) {
+                    Ok(bytes_read) => {
+                        if bytes_read == 0 {
                             return true;
                         }
                         
-                        // Check only first 128 bytes for speed
-                        let check_size = mmap.len().min(128);
-                        let bytes = &mmap[..check_size];
+                        let bytes = &buffer[..bytes_read];
                         
-                        // Check for binary content
                         !bytes.iter().any(|&b| b == 0 || (b < 32 && !matches!(b, 9 | 10 | 13)))
                     }
                     Err(_) => false,
@@ -219,12 +217,12 @@ impl FileCrawler {
         }
     }
 
-    /// Create file entry with minimal allocations.
+    /// Create file entry.
     fn create_file_entry(path: PathBuf, metadata: Metadata) -> FileEntry {
         let filename = path.file_name()
             .and_then(|n| n.to_str())
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| "unknown".to_owned());
+            .map(str::to_string)
+            .unwrap_or_else(|| String::from("unknown"));
 
         FileEntry {
             path,
@@ -232,17 +230,16 @@ impl FileCrawler {
             size: metadata.len(),
             modified: metadata.modified()
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-            content: String::new(), // Content loaded separately
+            content: String::new(),
             mime_type: String::new(),
             encoding: String::new(),
             hash: String::new(),
         }
     }
 
-    /// Load file content using memory mapping for speed.
+    /// Load file content.
     pub fn load_file_content(path: &Path, max_size: u64) -> Result<String> {
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
+        let metadata = std::fs::metadata(path)?;
         
         if metadata.len() > max_size {
             return Err(anyhow::anyhow!("File too large: {} bytes", metadata.len()));
@@ -252,10 +249,25 @@ impl FileCrawler {
             return Ok(String::new());
         }
         
-        let mmap = unsafe { Mmap::map(&file)? };
-        match std::str::from_utf8(&mmap) {
-            Ok(content) => Ok(content.to_string()),
-            Err(_) => Err(anyhow::anyhow!("File is not valid UTF-8")),
+        if metadata.len() > 1024 * 1024 {
+            use std::io::BufRead;
+            let file = std::fs::File::open(path)?;
+            let reader = std::io::BufReader::with_capacity(64 * 1024, file);
+            
+            let mut content = String::with_capacity((metadata.len() as usize).min(1024 * 1024));
+            for line_result in reader.lines() {
+                let line = line_result?;
+                content.push_str(&line);
+                content.push('\n');
+                
+                if content.len() > max_size as usize {
+                    return Err(anyhow::anyhow!("File content exceeds size limit during reading"));
+                }
+            }
+            Ok(content)
+        } else {
+            let content = std::fs::read_to_string(path)?;
+            Ok(content)
         }
     }
 }
