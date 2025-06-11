@@ -1,4 +1,4 @@
-use crate::types::{AppState};
+use crate::types::AppState;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -10,6 +10,14 @@ use ratatui::{
 pub struct SearchInputRenderer;
 
 impl SearchInputRenderer {
+    fn format_duration(duration_secs: f64) -> String {
+        if duration_secs < 1.0 {
+            format!("{:.0}ms", duration_secs * 1000.0)
+        } else {
+            format!("{:.1}s", duration_secs)
+        }
+    }
+
     pub fn render(
         f: &mut Frame,
         area: Rect,
@@ -18,6 +26,8 @@ impl SearchInputRenderer {
         total_files: usize,
         state: &AppState,
         spinner_char: &str,
+        crawling_stats: &Option<(usize, f64)>,
+        processing_stats: &Option<(usize, f64)>,
     ) {
         let search_color = if search_mode {
             Color::Magenta // Purple when active
@@ -31,14 +41,45 @@ impl SearchInputRenderer {
                 format!(" {} Crawling files... ", spinner_char)
             }
             AppState::Chunking => {
-                format!(" {} Processing files... ", spinner_char)
+                let crawling_info = if let Some((files_count, duration)) = crawling_stats {
+                    format!(
+                        "Crawled {} files in {} - ",
+                        files_count,
+                        Self::format_duration(*duration)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(" {}{} Processing files... ", crawling_info, spinner_char)
             }
             AppState::Ready => {
-                format!(" {} files indexed ", total_files)
+                let mut parts = Vec::new();
+
+                if let Some((files_count, duration)) = crawling_stats {
+                    parts.push(format!(
+                        "Crawled {} files in {}",
+                        files_count,
+                        Self::format_duration(*duration)
+                    ));
+                }
+
+                if let Some((chunks_count, duration)) = processing_stats {
+                    parts.push(format!(
+                        "Indexed {} chunks in {}",
+                        chunks_count,
+                        Self::format_duration(*duration)
+                    ));
+                }
+
+                if parts.is_empty() {
+                    format!(" {} files indexed ", total_files)
+                } else {
+                    format!(" {} ", parts.join(" - "))
+                }
             }
         };
 
-                let search_block = Block::default()
+        let search_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(search_color))

@@ -3,7 +3,6 @@ use crate::storage::ChunkStorage;
 use crate::types::{ChunkConfig, FileEntry, TextChunk};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use sqlx::Row;
 use std::path::Path;
 
 pub struct ProcessingService {
@@ -23,16 +22,16 @@ impl ProcessingService {
         })
     }
 
-    pub async fn process_files(&self, files: Vec<FileEntry>, max_file_size: u64) -> Result<()> {
+    pub async fn process_files(&self, files: Vec<FileEntry>, max_file_size: u64) -> Result<usize> {
         if files.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let config = self.config.clone();
         let files_to_process = self.filter_files(files).await?;
 
         if files_to_process.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let num_cpus = std::thread::available_parallelism()
@@ -77,7 +76,7 @@ impl ProcessingService {
             self.storage.store_chunks(&all_chunks).await?;
         }
 
-        Ok(())
+        Ok(all_chunks.len())
     }
 
     async fn filter_files(&self, files: Vec<FileEntry>) -> Result<Vec<FileEntry>> {
@@ -90,40 +89,17 @@ impl ProcessingService {
             return Ok(Vec::new());
         }
 
-        let placeholders = file_paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!(
-            "SELECT file_path, file_modified_time FROM chunks WHERE file_path IN ({}) GROUP BY file_path",
-            placeholders
-        );
-
-        let mut db_query = sqlx::query(&query);
-        for path in &file_paths {
-            db_query = db_query.bind(path);
-        }
-
-        let stored_files = db_query.fetch_all(&self.storage.pool).await?;
-        let stored_times: std::collections::HashMap<String, i64> = stored_files
-            .into_par_iter()
-            .map(|row| {
-                let path: String = row.get("file_path");
-                let modified: i64 = row.get("file_modified_time");
-                (path, modified)
-            })
-            .collect();
+        let stored_hashes = self.storage.get_file_hashes(&file_paths)?;
 
         let (to_process, to_delete): (Vec<_>, Vec<_>) = files
             .into_par_iter()
             .filter_map(|file| {
                 let file_path_str = file.path.to_string_lossy().to_string();
-                let current_timestamp = file
-                    .modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                let current_hash = &file.hash;
 
-                match stored_times.get(&file_path_str) {
-                    Some(&stored_timestamp) => {
-                        if current_timestamp > stored_timestamp {
+                match stored_hashes.get(&file_path_str) {
+                    Some(stored_hash) => {
+                        if current_hash != stored_hash {
                             Some((Some(file), Some(file_path_str)))
                         } else {
                             None
@@ -147,15 +123,7 @@ impl ProcessingService {
             return Ok(());
         }
 
-        let placeholders = file_paths.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!("DELETE FROM chunks WHERE file_path IN ({})", placeholders);
-
-        let mut db_query = sqlx::query(&query);
-        for path in file_paths {
-            db_query = db_query.bind(path);
-        }
-
-        db_query.execute(&self.storage.pool).await?;
+        self.storage.delete_chunks_for_files(file_paths)?;
         Ok(())
     }
 
@@ -183,7 +151,7 @@ impl ProcessingService {
                 1,
                 line_count,
                 Self::detect_language(&file_entry.path),
-                file_entry.modified,
+                file_entry.hash.clone(),
             )];
         }
 
@@ -208,7 +176,7 @@ impl ProcessingService {
                     chunk_start_line,
                     current_line - 1,
                     language.clone(),
-                    file_entry.modified,
+                    file_entry.hash.clone(),
                 ));
 
                 chunk_index += 1;
@@ -238,7 +206,7 @@ impl ProcessingService {
                 chunk_start_line,
                 current_line - 1,
                 language,
-                file_entry.modified,
+                file_entry.hash.clone(),
             ));
         }
 

@@ -10,6 +10,5 @@ pub mod embeddings;
 pub mod storage;
 pub mod tui;
 pub mod types;
-pub mod vector_db;
 
 pub use anyhow::{Error, Result};

@@ -2,182 +2,169 @@ pub mod service;
 
 use crate::types::TextChunk;
 use anyhow::{Context, Result};
-use sqlx::{Row, Sqlite, migrate::MigrateDatabase, sqlite::SqlitePool};
+use bincode::{Decode, Encode, config};
+use rocksdb::{DB, Options, WriteBatch};
 use std::path::Path;
+use std::sync::Arc;
 
-/// SQLite database manager for storing text chunks
 pub struct ChunkStorage {
-    pub(crate) pool: SqlitePool,
+    pub(crate) db: Arc<DB>,
 }
 
 impl ChunkStorage {
-    /// Create a new chunk storage instance
     pub async fn new(config_dir: &Path) -> Result<Self> {
-        // Ensure config directory exists
         tokio::fs::create_dir_all(config_dir)
             .await
             .context("Failed to create config directory")?;
 
-        let db_path = config_dir.join("chunks.db");
-        let db_url = format!("sqlite://{}", db_path.display());
+        let db_path = config_dir.join("chunks.rocksdb");
 
-        // Create database if it doesn't exist
-        if !Sqlite::database_exists(&db_url).await.unwrap_or(false) {
-            Sqlite::create_database(&db_url)
-                .await
-                .context("Failed to create database")?;
-        }
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        opts.set_max_write_buffer_number(3);
+        opts.set_target_file_size_base(64 * 1024 * 1024);
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(36);
+        opts.set_max_background_jobs(4);
+        opts.set_max_bytes_for_level_base(256 * 1024 * 1024);
+        opts.set_max_bytes_for_level_multiplier(10.0);
+        opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
 
-        // Connect to database
-        let pool = SqlitePool::connect(&db_url)
-            .await
-            .context("Failed to connect to database")?;
+        let db = DB::open(&opts, db_path).context("Failed to open RocksDB database")?;
 
-        let storage = Self { pool };
-
-        // Initialize schema
-        storage.init_schema().await?;
-
-        Ok(storage)
+        Ok(Self { db: Arc::new(db) })
     }
 
-    /// Initialize database schema
-    async fn init_schema(&self) -> Result<()> {
-        // Enable maximum performance SQLite settings
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA cache_size = 10000")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA temp_store = memory")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA mmap_size = 268435456")
-            .execute(&self.pool)
-            .await?; // 256MB
-        sqlx::query("PRAGMA page_size = 4096")
-            .execute(&self.pool)
-            .await?;
-
-        // Create optimized schema for embedding model inference
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                start_line INTEGER NOT NULL,
-                end_line INTEGER NOT NULL,
-                file_modified_time INTEGER NOT NULL,
-                UNIQUE(file_path, chunk_index)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to create chunks table")?;
-
-        // Add file_modified_time column if it doesn't exist (for existing databases)
-        let _ = sqlx::query("ALTER TABLE chunks ADD COLUMN file_modified_time INTEGER DEFAULT 0")
-            .execute(&self.pool)
-            .await;
-
-        // Create optimized indexes for embedding retrieval
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_file_path ON chunks(file_path)")
-            .execute(&self.pool)
-            .await?;
-
-        // Index for efficient chunk ordering within files
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_file_chunk ON chunks(file_path, chunk_index)")
-            .execute(&self.pool)
-            .await?;
-
-        // Index for modification time queries
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_file_modified ON chunks(file_path, file_modified_time)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Store multiple chunks in a batch with optimized performance
     pub async fn store_chunks(&self, chunks: &[TextChunk]) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
 
-        // Enable optimized SQLite settings for maximum performance
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA cache_size = 10000")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA temp_store = memory")
-            .execute(&self.pool)
-            .await?;
-
-        let mut tx = self.pool.begin().await?;
+        let mut batch = WriteBatch::default();
 
         for chunk in chunks {
             let file_path_str = chunk.file_path.to_string_lossy();
-            let modified_timestamp = chunk
-                .file_modified_time
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let key = format!("{}:{}", file_path_str, chunk.chunk_index);
 
-            sqlx::query(
-                r#"
-                INSERT OR REPLACE INTO chunks 
-                (file_path, chunk_index, content, start_line, end_line, file_modified_time)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(&*file_path_str)
-            .bind(chunk.chunk_index as i64)
-            .bind(&chunk.content)
-            .bind(chunk.start_line as i64)
-            .bind(chunk.end_line as i64)
-            .bind(modified_timestamp)
-            .execute(&mut *tx)
-            .await?;
+            let chunk_data = ChunkData {
+                file_path: file_path_str.to_string(),
+                chunk_index: chunk.chunk_index,
+                content: chunk.content.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                file_hash: chunk.file_hash.clone(),
+            };
+
+            let serialized = bincode::encode_to_vec(&chunk_data, config::standard())
+                .context("Failed to serialize chunk data")?;
+
+            batch.put(key.as_bytes(), serialized);
+
+            let file_key = format!("file:{}", file_path_str);
+            batch.put(file_key.as_bytes(), chunk.file_hash.as_bytes());
         }
 
-        tx.commit().await?;
+        self.db
+            .write(batch)
+            .context("Failed to write chunks to database")?;
+
         Ok(())
     }
 
     pub async fn close(self) {
-        self.pool.close().await;
+        drop(self.db);
     }
 
-    /// Clear all chunks from the database
     pub async fn clear_all_chunks(&self) -> Result<()> {
-        sqlx::query("DELETE FROM chunks")
-            .execute(&self.pool)
-            .await
-            .context("Failed to clear all chunks")?;
+        let mut batch = WriteBatch::default();
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+
+        for item in iter {
+            let (key, _) = item.context("Failed to iterate database")?;
+            batch.delete(&key);
+        }
+
+        self.db.write(batch).context("Failed to clear all chunks")?;
+
         Ok(())
     }
 
-    /// Get the total number of chunks in the database
     pub async fn get_chunk_count(&self) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) as count FROM chunks")
-            .fetch_one(&self.pool)
-            .await
-            .context("Failed to get chunk count")?;
+        let mut count = 0i64;
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
 
-        Ok(row.get("count"))
+        for item in iter {
+            let (key, _) = item.context("Failed to iterate database")?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("file:") {
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
+
+    pub fn get_file_hashes(
+        &self,
+        file_paths: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut result = std::collections::HashMap::new();
+
+        for file_path in file_paths {
+            let file_key = format!("file:{}", file_path);
+            if let Some(value) = self
+                .db
+                .get(file_key.as_bytes())
+                .context("Failed to read from database")?
+            {
+                if let Ok(hash_str) = String::from_utf8(value) {
+                    result.insert(file_path.clone(), hash_str);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn delete_chunks_for_files(&self, file_paths: &[String]) -> Result<()> {
+        let mut batch = WriteBatch::default();
+
+        for file_path in file_paths {
+            let file_key = format!("file:{}", file_path);
+            batch.delete(file_key.as_bytes());
+
+            let prefix = format!("{}:", file_path);
+            let mut keys_to_delete = Vec::new();
+
+            let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, _) = item.context("Failed to iterate database")?;
+                let key_str = String::from_utf8_lossy(&key);
+                if key_str.starts_with(&prefix) {
+                    keys_to_delete.push(key.to_vec());
+                }
+            }
+
+            for key in keys_to_delete {
+                batch.delete(&key);
+            }
+        }
+
+        self.db.write(batch).context("Failed to delete chunks")?;
+
+        Ok(())
+    }
+}
+
+#[derive(Encode, Decode)]
+struct ChunkData {
+    file_path: String,
+    chunk_index: usize,
+    content: String,
+    start_line: usize,
+    end_line: usize,
+    file_hash: String,
 }

@@ -36,6 +36,14 @@ pub enum StateUpdate {
     FileFound(FileEntry),
     StateChanged(crate::types::AppState),
     AllFilesCollected(Vec<FileEntry>),
+    CrawlingCompleted {
+        files_count: usize,
+        duration_secs: f64,
+    },
+    ProcessingCompleted {
+        chunks_count: usize,
+        duration_secs: f64,
+    },
 }
 
 pub struct App {
@@ -53,6 +61,10 @@ pub struct App {
     search_mode: bool,
     color_manager: ColorManager,
     data_changed: bool,
+    crawling_start_time: Option<Instant>,
+    processing_start_time: Option<Instant>,
+    crawling_stats: Option<(usize, f64)>, // files_count, duration_secs
+    processing_stats: Option<(usize, f64)>, // chunks_count, duration_secs
 }
 
 impl App {
@@ -78,6 +90,10 @@ impl App {
             search_mode: true,
             color_manager: ColorManager::new(),
             data_changed: false,
+            crawling_start_time: None,
+            processing_start_time: None,
+            crawling_stats: None,
+            processing_stats: None,
         })
     }
 
@@ -124,6 +140,7 @@ impl App {
         self.crawler_handle = Some(crawler_handle);
 
         let state_tx = self.state_tx.clone();
+        let crawling_start_time = Instant::now();
         tokio::spawn(async move {
             let mut collected_files = Vec::new();
             while let Some(file_entry) = file_rx.recv().await {
@@ -131,6 +148,15 @@ impl App {
                 collected_files.push(file_entry);
             }
             if !collected_files.is_empty() {
+                let crawling_duration = crawling_start_time.elapsed().as_secs_f64();
+                let files_count = collected_files.len();
+
+                // Send crawling completed message
+                let _ = state_tx.send(StateUpdate::CrawlingCompleted {
+                    files_count,
+                    duration_secs: crawling_duration,
+                });
+
                 let _ = state_tx.send(StateUpdate::AllFilesCollected(collected_files));
             }
         });
@@ -153,6 +179,15 @@ impl App {
                         self.data_changed = true;
                     }
                     StateUpdate::StateChanged(new_state) => {
+                        match new_state {
+                            crate::types::AppState::Crawling => {
+                                self.crawling_start_time = Some(Instant::now());
+                            }
+                            crate::types::AppState::Chunking => {
+                                self.processing_start_time = Some(Instant::now());
+                            }
+                            _ => {}
+                        }
                         self.app_state.state = new_state;
                         self.data_changed = true;
                     }
@@ -162,6 +197,20 @@ impl App {
                         tokio::spawn(async move {
                             Self::start_chunking(state_tx, files, max_file_size).await;
                         });
+                    }
+                    StateUpdate::CrawlingCompleted {
+                        files_count,
+                        duration_secs,
+                    } => {
+                        self.crawling_stats = Some((files_count, duration_secs));
+                        self.data_changed = true;
+                    }
+                    StateUpdate::ProcessingCompleted {
+                        chunks_count,
+                        duration_secs,
+                    } => {
+                        self.processing_stats = Some((chunks_count, duration_secs));
+                        self.data_changed = true;
                     }
                 }
             }
@@ -238,6 +287,7 @@ impl App {
         files: Vec<FileEntry>,
         max_file_size: u64,
     ) {
+        let processing_start_time = Instant::now();
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .join("sema");
@@ -253,7 +303,15 @@ impl App {
             };
 
         match processing_service.process_files(files, max_file_size).await {
-            Ok(()) => {
+            Ok(chunks_count) => {
+                let processing_duration = processing_start_time.elapsed().as_secs_f64();
+
+                // Send processing completed message
+                let _ = state_tx.send(StateUpdate::ProcessingCompleted {
+                    chunks_count,
+                    duration_secs: processing_duration,
+                });
+
                 let _ = state_tx.send(StateUpdate::StateChanged(crate::types::AppState::Ready));
             }
             Err(e) => {
@@ -309,6 +367,8 @@ impl App {
             files.len(),
             &state,
             spinner_char,
+            &self.crawling_stats,
+            &self.processing_stats,
         );
     }
 }

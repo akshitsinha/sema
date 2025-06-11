@@ -39,7 +39,7 @@ pub struct TextChunk {
     pub content: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub file_modified_time: SystemTime,
+    pub file_hash: String,
 }
 
 impl TextChunk {
@@ -50,7 +50,7 @@ impl TextChunk {
         start_line: usize,
         end_line: usize,
         _language: Option<String>,
-        file_modified_time: SystemTime,
+        file_hash: String,
     ) -> Self {
         Self {
             id: None,
@@ -59,7 +59,7 @@ impl TextChunk {
             content,
             start_line,
             end_line,
-            file_modified_time,
+            file_hash,
         }
     }
 }
