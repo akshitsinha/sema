@@ -288,7 +288,7 @@ impl FileCrawler {
     ) -> Result<()> {
         // Thread count for IO parallelism
         let cpu_count = num_cpus::get();
-        let thread_count = (cpu_count * 6).max(24).min(128);
+        let thread_count = (cpu_count * 6).clamp(24, 128);
 
         let mut walker = WalkBuilder::new(&root_path);
 

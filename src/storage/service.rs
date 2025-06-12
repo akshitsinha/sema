@@ -1,4 +1,5 @@
 use crate::crawler::FileCrawler;
+use crate::search::{SearchResult, SearchService};
 use crate::storage::ChunkStorage;
 use crate::types::{ChunkConfig, FileEntry, TextChunk};
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use std::path::Path;
 
 pub struct ProcessingService {
     storage: ChunkStorage,
+    search: SearchService,
     config: ChunkConfig,
 }
 
@@ -15,9 +17,14 @@ impl ProcessingService {
         let storage = ChunkStorage::new(config_dir)
             .await
             .context("Failed to initialize chunk storage")?;
+        
+        let search = SearchService::new(config_dir)
+            .await
+            .context("Failed to initialize search service")?;
 
         Ok(Self {
             storage,
+            search,
             config: chunk_config,
         })
     }
@@ -37,7 +44,7 @@ impl ProcessingService {
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-        let batch_size = (files_to_process.len() / num_cpus).max(1).min(64);
+        let batch_size = (files_to_process.len() / num_cpus).clamp(1, 64);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -74,6 +81,7 @@ impl ProcessingService {
 
         if !all_chunks.is_empty() {
             self.storage.store_chunks(&all_chunks).await?;
+            self.search.index_chunks(&all_chunks).await?;
         }
 
         Ok(all_chunks.len())
@@ -124,6 +132,7 @@ impl ProcessingService {
         }
 
         self.storage.delete_chunks_for_files(file_paths)?;
+        self.search.remove_chunks_for_files(file_paths).await?;
         Ok(())
     }
 
@@ -162,8 +171,8 @@ impl ProcessingService {
         let mut current_line = 1;
         let language = Self::detect_language(&file_entry.path);
 
-        let mut lines = content.lines();
-        while let Some(line) = lines.next() {
+        let lines = content.lines();
+        for line in lines {
             let line_with_newline = format!("{}\n", line);
 
             if current_chunk.len() + line_with_newline.len() > config.max_chunk_size
@@ -183,7 +192,7 @@ impl ProcessingService {
                 current_chunk = String::with_capacity(config.max_chunk_size);
 
                 if config.overlap_size > 0 {
-                    let overlap_lines = (config.overlap_size / 50).max(1).min(5);
+                    let overlap_lines = (config.overlap_size / 50).clamp(1, 5);
                     current_chunk.push_str(&line_with_newline);
                     chunk_start_line = current_line.saturating_sub(overlap_lines - 1);
                 } else {
@@ -242,7 +251,13 @@ impl ProcessingService {
     }
 
     pub async fn clear_all_chunks(&self) -> Result<()> {
-        self.storage.clear_all_chunks().await
+        self.storage.clear_all_chunks().await?;
+        self.search.clear_index().await?;
+        Ok(())
+    }
+
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search.search(query, limit).await
     }
 
     pub async fn close(self) {

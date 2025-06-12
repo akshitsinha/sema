@@ -11,7 +11,7 @@ tui-input = "0.12.1"
 tui-textarea = "0.7.0"
 
 # Async runtime and utilities
-tokio = "1.45.1"
+tokio = { version = "1.45.1", features = ["full"] }
 tokio-util = "0.7.15"
 futures = "0.3.31"
 parking_lot = "0.12.4"
@@ -33,18 +33,11 @@ unicode-width = "0.2.0"
 rocksdb = "0.23.0"
 bincode = "2.0.1"
 
+# Full text search
+tantivy = "0.22.0"
+
 # Fast hashing
 blake3 = "1.8.2"
-
-# Vector database
-qdrant-client = "1.14.0"
-
-# Embedding generation (local models)
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
-candle-transformers = "0.9.1"
-tokenizers = "0.21.1"
-hf-hub = "0.4.2"
 
 # Syntax highlighting for file previews
 syntect = "5.2.0"

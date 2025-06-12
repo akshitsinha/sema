@@ -20,11 +20,18 @@ impl FileListRenderer {
         selected_file_index: usize,
         file_list_scroll_offset: usize,
         color_manager: &ColorManager,
+        is_focused: bool,
     ) {
+        let border_color = if is_focused {
+            Color::Red // Red when focused/selected
+        } else {
+            Color::Black // Black when not selected
+        };
+
         let files_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Blue))
+            .border_style(Style::default().fg(border_color))
             .style(Style::default().bg(Color::Reset));
 
         // Calculate how many files we can display

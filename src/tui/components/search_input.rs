@@ -28,11 +28,14 @@ impl SearchInputRenderer {
         spinner_char: &str,
         crawling_stats: &Option<(usize, f64)>,
         processing_stats: &Option<(usize, f64)>,
+        is_focused: bool,
+        search_error: &Option<String>,
+        search_results_count: Option<usize>,
     ) {
-        let search_color = if search_mode {
-            Color::Magenta // Purple when active
+        let search_color = if is_focused {
+            Color::Red // Red when focused/selected
         } else {
-            Color::Gray // Gray when inactive
+            Color::Black // Black when not selected
         };
 
         // Generate title based on indexing state and file count
@@ -52,29 +55,60 @@ impl SearchInputRenderer {
                 };
                 format!(" {}{} Processing files... ", crawling_info, spinner_char)
             }
-            AppState::Ready => {
-                let mut parts = Vec::new();
+            AppState::Ready | AppState::Searching => {
+                // Show search results count if available and search input is provided
+                if let Some(count) = search_results_count {
+                    if !search_input.trim().is_empty() {
+                        format!(" {} results found ", count)
+                    } else {
+                        let mut parts = Vec::new();
 
-                if let Some((files_count, duration)) = crawling_stats {
-                    parts.push(format!(
-                        "Crawled {} files in {}",
-                        files_count,
-                        Self::format_duration(*duration)
-                    ));
-                }
+                        if let Some((files_count, duration)) = crawling_stats {
+                            parts.push(format!(
+                                "Crawled {} files in {}",
+                                files_count,
+                                Self::format_duration(*duration)
+                            ));
+                        }
 
-                if let Some((chunks_count, duration)) = processing_stats {
-                    parts.push(format!(
-                        "Indexed {} chunks in {}",
-                        chunks_count,
-                        Self::format_duration(*duration)
-                    ));
-                }
+                        if let Some((chunks_count, duration)) = processing_stats {
+                            parts.push(format!(
+                                "Indexed {} chunks in {}",
+                                chunks_count,
+                                Self::format_duration(*duration)
+                            ));
+                        }
 
-                if parts.is_empty() {
-                    format!(" {} files indexed ", total_files)
+                        if parts.is_empty() {
+                            format!(" {} files indexed ", total_files)
+                        } else {
+                            format!(" {} ", parts.join(" - "))
+                        }
+                    }
                 } else {
-                    format!(" {} ", parts.join(" - "))
+                    let mut parts = Vec::new();
+
+                    if let Some((files_count, duration)) = crawling_stats {
+                        parts.push(format!(
+                            "Crawled {} files in {}",
+                            files_count,
+                            Self::format_duration(*duration)
+                        ));
+                    }
+
+                    if let Some((chunks_count, duration)) = processing_stats {
+                        parts.push(format!(
+                            "Indexed {} chunks in {}",
+                            chunks_count,
+                            Self::format_duration(*duration)
+                        ));
+                    }
+
+                    if parts.is_empty() {
+                        format!(" {} files indexed ", total_files)
+                    } else {
+                        format!(" {} ", parts.join(" - "))
+                    }
                 }
             }
         };
@@ -91,37 +125,56 @@ impl SearchInputRenderer {
             )
             .style(Style::default().bg(Color::Reset));
 
-        // Show the search input or a placeholder
-        let search_text = if search_input.is_empty() {
+        // Show the search input, error message, or a placeholder
+        let (search_text, text_style) = if let Some(error) = search_error {
+            // Show error message in red
+            (
+                error.as_str(),
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        } else if search_input.is_empty() {
             if search_mode {
-                "" // Active but empty
+                (
+                    "Type your search query...",
+                    Style::default().fg(Color::DarkGray),
+                )
             } else {
-                "Press '/' to search, 'q' or ESC to exit"
+                (
+                    "Press '/' to search, 'q' or ESC to exit",
+                    Style::default().fg(Color::DarkGray),
+                )
             }
         } else {
-            search_input
+            // Show actual search input
+            (
+                search_input,
+                if search_mode {
+                    Style::default()
+                        .fg(Color::Reset) // Use default terminal text color
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            )
         };
 
-        let search_line = Line::from(vec![Span::styled(
-            search_text,
-            if search_mode {
-                Style::default()
-                    .fg(Color::Reset) // Use default terminal text color
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        )]);
+        let search_line = Line::from(vec![Span::styled(search_text, text_style)]);
 
         let search_para = Paragraph::new(vec![search_line]).block(search_block);
 
         f.render_widget(search_para, area);
 
-        // Show cursor when in search mode
-        if search_mode {
+        // Show cursor when in search mode and there's no error
+        if search_mode && search_error.is_none() {
             let cursor_x = area.x + 1 + search_input.len() as u16;
             let cursor_y = area.y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
+
+            // Ensure cursor is within bounds
+            if cursor_x < area.x + area.width.saturating_sub(1) {
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
         }
     }
 }

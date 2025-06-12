@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod crawler;
 pub mod embeddings;
+pub mod search;
 pub mod storage;
 pub mod tui;
 pub mod types;

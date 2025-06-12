@@ -153,4 +153,21 @@ pub enum AppState {
     Crawling,
     Chunking,
     Ready,
+    Searching,
+}
+
+/// UI mode for different interaction states
+#[derive(Debug, Clone, PartialEq)]
+pub enum UIMode {
+    SearchInput,   // REPL input mode
+    SearchResults, // Browsing search results
+    FilePreview,   // Viewing file content with highlights
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusedWindow {
+    SearchInput,
+    SearchResults,
+    FilePreview,
+    FileList,
 }
