@@ -24,11 +24,11 @@ pub struct Cli {
     #[arg(long, help = "Follow symbolic links")]
     pub follow_symlinks: bool,
 
-    /// Additional file extensions to include
+    /// Override file extensions to crawl (ignores defaults)
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Additional file extensions to include (comma-separated)"
+        help = "File extensions to crawl (comma-separated). When specified, ignores default extensions."
     )]
     pub extensions: Option<Vec<String>>,
 

@@ -1,10 +1,9 @@
-use crate::crawler::FileCrawler;
 use crate::search::{SearchResult, SearchService};
 use crate::storage::ChunkStorage;
-use crate::types::{ChunkConfig, FileEntry, TextChunk};
+use crate::types::{ChunkConfig, TextChunk};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct ProcessingService {
     storage: ChunkStorage,
@@ -29,7 +28,7 @@ impl ProcessingService {
         })
     }
 
-    pub async fn process_files(&self, files: Vec<FileEntry>, max_file_size: u64) -> Result<usize> {
+    pub async fn process_files(&self, files: Vec<PathBuf>, max_file_size: u64) -> Result<usize> {
         if files.is_empty() {
             return Ok(0);
         }
@@ -57,8 +56,8 @@ impl ProcessingService {
                 tokio::task::spawn_blocking(move || {
                     let chunks: Vec<TextChunk> = batch
                         .into_par_iter()
-                        .flat_map(|file_entry| {
-                            Self::process_file(&file_entry, max_file_size, &config)
+                        .flat_map(|file_path| {
+                            Self::process_file(&file_path, max_file_size, &config)
                         })
                         .collect();
                     if !chunks.is_empty() {
@@ -87,10 +86,10 @@ impl ProcessingService {
         Ok(all_chunks.len())
     }
 
-    async fn filter_files(&self, files: Vec<FileEntry>) -> Result<Vec<FileEntry>> {
+    async fn filter_files(&self, files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         let file_paths: Vec<String> = files
             .par_iter()
-            .map(|f| f.path.to_string_lossy().to_string())
+            .map(|f| f.to_string_lossy().to_string())
             .collect();
 
         if file_paths.is_empty() {
@@ -101,19 +100,24 @@ impl ProcessingService {
 
         let (to_process, to_delete): (Vec<_>, Vec<_>) = files
             .into_par_iter()
-            .filter_map(|file| {
-                let file_path_str = file.path.to_string_lossy().to_string();
-                let current_hash = &file.hash;
+            .filter_map(|file_path| {
+                let file_path_str = file_path.to_string_lossy().to_string();
+
+                // Compute current hash for the file
+                let current_hash = match Self::compute_file_hash(&file_path) {
+                    Ok(hash) => hash,
+                    Err(_) => return None, // Skip files we can't read
+                };
 
                 match stored_hashes.get(&file_path_str) {
                     Some(stored_hash) => {
-                        if current_hash != stored_hash {
-                            Some((Some(file), Some(file_path_str)))
+                        if &current_hash != stored_hash {
+                            Some((Some(file_path), Some(file_path_str)))
                         } else {
                             None
                         }
                     }
-                    None => Some((Some(file), None)),
+                    None => Some((Some(file_path), None)),
                 }
             })
             .unzip();
@@ -137,11 +141,11 @@ impl ProcessingService {
     }
 
     fn process_file(
-        file_entry: &FileEntry,
+        file_path: &PathBuf,
         max_file_size: u64,
         config: &ChunkConfig,
     ) -> Vec<TextChunk> {
-        let content = match FileCrawler::load_file_content(&file_entry.path, max_file_size) {
+        let content = match Self::load_file_content(file_path, max_file_size) {
             Ok(content) => content,
             Err(_) => return Vec::new(),
         };
@@ -150,17 +154,23 @@ impl ProcessingService {
             return Vec::new();
         }
 
+        // Compute file hash
+        let file_hash = match Self::compute_file_hash(file_path) {
+            Ok(hash) => hash,
+            Err(_) => return Vec::new(),
+        };
+
         let content_len = content.len();
         if content_len <= config.max_chunk_size {
             let line_count = content.matches('\n').count() + 1;
             return vec![TextChunk::new(
-                file_entry.path.clone(),
+                file_path.clone(),
                 0,
                 content,
                 1,
                 line_count,
-                Self::detect_language(&file_entry.path),
-                file_entry.hash.clone(),
+                Self::detect_language(file_path),
+                file_hash,
             )];
         }
 
@@ -169,7 +179,7 @@ impl ProcessingService {
         let mut current_chunk = String::with_capacity(config.max_chunk_size);
         let mut chunk_start_line = 1;
         let mut current_line = 1;
-        let language = Self::detect_language(&file_entry.path);
+        let language = Self::detect_language(file_path);
 
         let lines = content.lines();
         for line in lines {
@@ -179,13 +189,13 @@ impl ProcessingService {
                 && !current_chunk.is_empty()
             {
                 chunks.push(TextChunk::new(
-                    file_entry.path.clone(),
+                    file_path.clone(),
                     chunk_index,
                     current_chunk,
                     chunk_start_line,
                     current_line - 1,
                     language.clone(),
-                    file_entry.hash.clone(),
+                    file_hash.clone(),
                 ));
 
                 chunk_index += 1;
@@ -209,13 +219,13 @@ impl ProcessingService {
 
         if !current_chunk.trim().is_empty() {
             chunks.push(TextChunk::new(
-                file_entry.path.clone(),
+                file_path.clone(),
                 chunk_index,
                 current_chunk,
                 chunk_start_line,
                 current_line - 1,
                 language,
-                file_entry.hash.clone(),
+                file_hash,
             ));
         }
 
@@ -262,5 +272,45 @@ impl ProcessingService {
 
     pub async fn close(self) {
         self.storage.close().await;
+    }
+
+    /// Compute a hash for a file based on its content
+    fn compute_file_hash(file_path: &Path) -> Result<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let content = std::fs::read_to_string(file_path)?;
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        Ok(format!("{:x}", hasher.finish()))
+    }
+
+    /// Load file content with optimized reading for large files
+    fn load_file_content(path: &Path, max_size: u64) -> Result<String> {
+        let metadata = std::fs::metadata(path)?;
+
+        if metadata.len() == 0 {
+            return Ok(String::new());
+        }
+
+        // For large files, use buffered reading
+        if metadata.len() > 2 * 1024 * 1024 {
+            use std::io::BufRead;
+            let file = std::fs::File::open(path)?;
+            let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+
+            let mut content =
+                String::with_capacity((metadata.len() as usize).min(max_size as usize));
+            let mut buffer = String::with_capacity(16384);
+
+            while reader.read_line(&mut buffer)? > 0 {
+                content.push_str(&buffer);
+                buffer.clear();
+            }
+            Ok(content)
+        } else {
+            // For small files
+            std::fs::read_to_string(path).context("Failed to read file")
+        }
     }
 }

@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::crawler::FileCrawler;
 use crate::search::SearchResult;
 use crate::storage::service::ProcessingService;
-use crate::types::{ChunkConfig, CrawlerConfig, FileEntry, FocusedWindow, UIMode};
+use crate::types::{ChunkConfig, CrawlerConfig, FocusedWindow, UIMode};
 
 use super::components::{
     ColorManager, FileListRenderer, FilePreviewRenderer, SearchInputRenderer, SearchResultsRenderer,
@@ -34,15 +34,15 @@ use super::utils::SpinnerUtils;
 
 #[derive(Clone)]
 pub struct AppStateData {
-    pub crawled_files: Vec<FileEntry>,
+    pub crawled_files: Vec<PathBuf>,
     pub state: crate::types::AppState,
 }
 
 #[derive(Debug)]
 pub enum StateUpdate {
-    FileFound(FileEntry),
+    FileFound(PathBuf),
     StateChanged(crate::types::AppState),
-    AllFilesCollected(Vec<FileEntry>),
+    AllFilesCollected(Vec<PathBuf>),
     CrawlingCompleted {
         files_count: usize,
         duration_secs: f64,
@@ -382,7 +382,7 @@ impl App {
 
     async fn start_chunking(
         state_tx: mpsc::UnboundedSender<StateUpdate>,
-        files: Vec<FileEntry>,
+        files: Vec<PathBuf>,
         max_file_size: u64,
     ) {
         let processing_start_time = Instant::now();
@@ -440,7 +440,7 @@ impl App {
         }
     }
 
-    fn render_ready(&mut self, f: &mut Frame, area: Rect, files: &[FileEntry]) {
+    fn render_ready(&mut self, f: &mut Frame, area: Rect, files: &[PathBuf]) {
         let state = self.app_state.state.clone();
 
         // If we have search results and we're in Ready state, use the search interface rendering
@@ -454,7 +454,7 @@ impl App {
                 .split(area);
 
             // Show file list in main area
-            let file_refs: Vec<&FileEntry> = files.iter().collect();
+            let file_refs: Vec<&PathBuf> = files.iter().collect();
             FileListRenderer::render(
                 f,
                 chunks[0],

@@ -1,5 +1,4 @@
 use super::colors::ColorManager;
-use crate::types::FileEntry;
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
@@ -15,7 +14,7 @@ impl FileListRenderer {
     pub fn render(
         f: &mut Frame,
         area: Rect,
-        files: &[&FileEntry],
+        files: &[&PathBuf],
         root_path: &PathBuf,
         selected_file_index: usize,
         file_list_scroll_offset: usize,
@@ -80,13 +79,13 @@ impl FileListRenderer {
                 let is_selected = actual_idx == adjusted_selected;
 
                 // Get the full path relative to root
-                let full_path = if let Ok(relative_path) = file.path.strip_prefix(root_path) {
+                let full_path = if let Ok(relative_path) = file.strip_prefix(root_path) {
                     relative_path.to_string_lossy().to_string()
                 } else {
-                    file.path.to_string_lossy().to_string()
+                    file.to_string_lossy().to_string()
                 };
 
-                let extension = file.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let extension = file.extension().and_then(|e| e.to_str()).unwrap_or("");
 
                 // Color code by file type with dynamic assignment
                 let base_color = color_manager.get_color_for_extension(extension);
