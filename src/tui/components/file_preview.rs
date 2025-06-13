@@ -245,11 +245,7 @@ impl FilePreviewRenderer {
 
         // Ensure scroll_offset doesn't exceed file bounds
         let total_lines = highlighted_lines.len();
-        let max_scroll = if total_lines > available_height {
-            total_lines - available_height
-        } else {
-            0
-        };
+        let max_scroll = total_lines.saturating_sub(available_height);
         let effective_scroll = scroll_offset.min(max_scroll);
 
         // Calculate display range
@@ -300,7 +296,7 @@ impl FilePreviewRenderer {
         // Determine syntax from file extension
         let syntax = syntax_set
             .find_syntax_for_file(file_path)
-            .unwrap_or_else(|_| None)
+            .unwrap_or(None)
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
 
         let mut highlighter = HighlightLines::new(syntax, theme);

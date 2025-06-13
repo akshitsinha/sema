@@ -40,10 +40,6 @@ pub struct Cli {
     )]
     pub exclude: Option<Vec<String>>,
 
-    /// Set embedding model
-    #[arg(long, help = "Set the embedding model to use")]
-    pub model: Option<String>,
-
     /// Ignore files listed in .gitignore files
     #[arg(long, help = "Ignore files and patterns listed in .gitignore files")]
     pub ignore_gitignore: bool,

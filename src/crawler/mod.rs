@@ -10,7 +10,6 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::types::{CrawlerConfig, FileEntry};
 
-/// File crawler for discovering and processing files in directories.
 pub struct FileCrawler {
     config: CrawlerConfig,
     extension_set: HashSet<String>,
@@ -19,7 +18,6 @@ pub struct FileCrawler {
 }
 
 impl FileCrawler {
-    /// Creates a new file crawler.
     pub fn new(config: CrawlerConfig) -> Self {
         let extension_set = Self::build_extension_set(&config);
         let lock_file_patterns = Self::build_lock_patterns();
@@ -33,12 +31,10 @@ impl FileCrawler {
         }
     }
 
-    /// Builds extension set for file filtering.
     fn build_extension_set(config: &CrawlerConfig) -> HashSet<String> {
         let mut set = HashSet::with_capacity(64);
 
         if config.file_extensions.is_empty() {
-            // Default text extensions
             for ext in [
                 // Programming languages
                 "rs",
@@ -151,10 +147,10 @@ impl FileCrawler {
             }
         } else {
             for ext in &config.file_extensions {
-                let clean_ext = if ext.starts_with("*.") {
-                    &ext[2..]
-                } else if ext.starts_with('.') {
-                    &ext[1..]
+                let clean_ext = if let Some(stripped) = ext.strip_prefix("*.") {
+                    stripped
+                } else if let Some(stripped) = ext.strip_prefix('.') {
+                    stripped
                 } else {
                     ext
                 };
@@ -306,7 +302,7 @@ impl FileCrawler {
 
         // Add ignore patterns
         for pattern in &config.exclude_patterns {
-            walker.add_ignore(&format!("!{}", pattern));
+            walker.add_ignore(format!("!{}", pattern));
         }
 
         let walker = walker.build_parallel();

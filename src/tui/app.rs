@@ -736,9 +736,7 @@ impl App {
             let file_path = result.chunk.file_path.clone();
 
             // Only keep the first result per file (highest score since results are sorted)
-            if !file_results.contains_key(&file_path) {
-                file_results.insert(file_path, result);
-            }
+            file_results.entry(file_path).or_insert(result);
         }
 
         // Convert back to vector and sort by score

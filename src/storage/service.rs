@@ -17,7 +17,7 @@ impl ProcessingService {
         let storage = ChunkStorage::new(config_dir)
             .await
             .context("Failed to initialize chunk storage")?;
-        
+
         let search = SearchService::new(config_dir)
             .await
             .context("Failed to initialize search service")?;

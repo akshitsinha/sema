@@ -6,6 +6,12 @@ pub struct ColorManager {
     default_color: Color,
 }
 
+impl Default for ColorManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ColorManager {
     pub fn new() -> Self {
         // Fixed colors for common file extensions

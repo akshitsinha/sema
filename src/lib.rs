@@ -1,12 +1,11 @@
 //! Sema - Semantic File Search
 //!
 //! A terminal application for crawling text files recursively and providing
-//! semantic search capabilities using local embedding models and Qdrant vector database.
+//! full-text search capabilities using Tantivy.
 
 pub mod cli;
 pub mod config;
 pub mod crawler;
-pub mod embeddings;
 pub mod search;
 pub mod storage;
 pub mod tui;
