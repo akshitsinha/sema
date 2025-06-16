@@ -1,58 +1,6 @@
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextChunk {
-    pub id: Option<i64>,
-    pub file_path: PathBuf,
-    pub chunk_index: usize,
-    pub content: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub file_hash: String,
-}
-
-impl TextChunk {
-    pub fn new(
-        file_path: PathBuf,
-        chunk_index: usize,
-        content: String,
-        start_line: usize,
-        end_line: usize,
-        _language: Option<String>,
-        file_hash: String,
-    ) -> Self {
-        Self {
-            id: None,
-            file_path,
-            chunk_index,
-            content,
-            start_line,
-            end_line,
-            file_hash,
-        }
-    }
-}
-
-/// Configuration for text chunking
-#[derive(Debug, Clone)]
-pub struct ChunkConfig {
-    pub max_chunk_size: usize,
-    pub overlap_size: usize,
-    pub respect_line_boundaries: bool,
-    pub respect_function_boundaries: bool,
-}
-
-impl Default for ChunkConfig {
-    fn default() -> Self {
-        Self {
-            max_chunk_size: 1000,
-            overlap_size: 200,
-            respect_line_boundaries: true,
-            respect_function_boundaries: true,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlerConfig {
@@ -117,5 +65,40 @@ pub enum FocusedWindow {
     SearchInput,
     SearchResults,
     FilePreview,
-    FileList,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ChunkConfig {
+    pub chunk_size: usize,
+    pub overlap_size: usize,
+    pub min_chunk_size: usize,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: 1000,   // chars per chunk
+            overlap_size: 100,  // overlap between chunks
+            min_chunk_size: 50, // minimum chunk size
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct Chunk {
+    pub id: String,
+    pub file_path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct FileIndex {
+    pub file_path: PathBuf,
+    pub hash: String,
+    pub last_modified: u64,
+    pub chunk_count: usize,
+    pub indexed_at: u64,
 }

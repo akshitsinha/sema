@@ -1,316 +1,424 @@
-use crate::search::{SearchResult, SearchService};
-use crate::storage::ChunkStorage;
-use crate::types::{ChunkConfig, TextChunk};
-use anyhow::{Context, Result};
-use rayon::prelude::*;
+use anyhow::Result;
+use blake3::Hasher;
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use tantivy::{
+    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument,
+    collector::TopDocs,
+    directory::MmapDirectory,
+    doc,
+    query::QueryParser,
+    schema::{Field, OwnedValue, STORED, Schema, TEXT},
+};
+use tokio::task;
+
+use super::Database;
+use crate::types::{Chunk, ChunkConfig, FileIndex};
 
 pub struct ProcessingService {
-    storage: ChunkStorage,
-    search: SearchService,
-    config: ChunkConfig,
+    db: Database,
+    index: Index,
+    index_writer: IndexWriter,
+    index_reader: IndexReader,
+    content_field: Field,
+    path_field: Field,
+    start_line_field: Field,
+    end_line_field: Field,
 }
 
 impl ProcessingService {
-    pub async fn new(config_dir: &Path, chunk_config: ChunkConfig) -> Result<Self> {
-        let storage = ChunkStorage::new(config_dir)
-            .await
-            .context("Failed to initialize chunk storage")?;
+    pub async fn new(data_dir: &Path, _chunk_config: ChunkConfig) -> Result<Self> {
+        // Create directories
+        let db_path = data_dir.join("db");
+        let index_path = data_dir.join("index");
 
-        let search = SearchService::new(config_dir)
-            .await
-            .context("Failed to initialize search service")?;
+        fs::create_dir_all(&db_path)?;
+        fs::create_dir_all(&index_path)?;
+
+        // Initialize RocksDB
+        let db = Database::new(&db_path)?;
+
+        // Initialize Tantivy schema
+        let mut schema_builder = Schema::builder();
+        let content_field = schema_builder.add_text_field("content", TEXT);
+        let path_field = schema_builder.add_text_field("path", TEXT | STORED);
+        let start_line_field = schema_builder.add_u64_field("start_line", STORED);
+        let end_line_field = schema_builder.add_u64_field("end_line", STORED);
+        let schema = schema_builder.build();
+
+        // Initialize Tantivy index
+        let index_dir = MmapDirectory::open(&index_path)?;
+        let index = Index::open_or_create(index_dir, schema.clone())?;
+
+        let index_writer = index.writer(50_000_000)?; // 50MB heap
+        let index_reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
 
         Ok(Self {
-            storage,
-            search,
-            config: chunk_config,
+            db,
+            index,
+            index_writer,
+            index_reader,
+            content_field,
+            path_field,
+            start_line_field,
+            end_line_field,
         })
     }
 
-    pub async fn process_files(&self, files: Vec<PathBuf>, max_file_size: u64) -> Result<usize> {
-        if files.is_empty() {
-            return Ok(0);
-        }
+    pub async fn process_files(
+        &mut self,
+        files: Vec<PathBuf>,
+        max_file_size: u64,
+    ) -> Result<usize> {
+        let mut total_chunks = 0;
 
-        let config = self.config.clone();
-        let files_to_process = self.filter_files(files).await?;
+        // Load already indexed files in parallel
+        let file_check_futures: Vec<_> = files
+            .iter()
+            .map(|file_path| {
+                let path = file_path.clone();
+                let db_handle = self.db.clone_handle();
 
-        if files_to_process.is_empty() {
-            return Ok(0);
-        }
+                task::spawn(async move {
+                    let file_key = format!("file_index:{}", path.to_string_lossy());
+                    if let Ok(Some(data)) = db_handle.get(file_key.as_bytes()) {
+                        if let Ok((file_index, _)) = bincode::decode_from_slice::<FileIndex, _>(
+                            &data,
+                            bincode::config::standard(),
+                        ) {
+                            // Check if file needs reindexing
+                            let metadata = fs::metadata(&path).ok()?;
+                            let current_modified = metadata
+                                .modified()
+                                .ok()?
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .ok()?
+                                .as_secs();
 
-        let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
-        let batch_size = (files_to_process.len() / num_cpus).clamp(1, 64);
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let handles: Vec<_> = files_to_process
-            .chunks(batch_size)
-            .map(|batch| {
-                let batch = batch.to_vec();
-                let config = config.clone();
-                let tx = tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let chunks: Vec<TextChunk> = batch
-                        .into_par_iter()
-                        .flat_map(|file_path| {
-                            Self::process_file(&file_path, max_file_size, &config)
-                        })
-                        .collect();
-                    if !chunks.is_empty() {
-                        let _ = tx.send(chunks);
+                            if current_modified <= file_index.last_modified {
+                                return Some(path);
+                            }
+                        }
                     }
+                    None
                 })
             })
             .collect();
 
-        drop(tx);
-
-        let mut all_chunks = Vec::new();
-        while let Some(chunks) = rx.recv().await {
-            all_chunks.extend(chunks);
-        }
-
-        for handle in handles {
-            handle.await?;
-        }
-
-        if !all_chunks.is_empty() {
-            self.storage.store_chunks(&all_chunks).await?;
-            self.search.index_chunks(&all_chunks).await?;
-        }
-
-        Ok(all_chunks.len())
-    }
-
-    async fn filter_files(&self, files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-        let file_paths: Vec<String> = files
-            .par_iter()
-            .map(|f| f.to_string_lossy().to_string())
+        let check_results = futures::future::join_all(file_check_futures).await;
+        let indexed_files: HashSet<PathBuf> = check_results
+            .into_iter()
+            .filter_map(|result| result.ok().flatten())
             .collect();
 
-        if file_paths.is_empty() {
-            return Ok(Vec::new());
-        }
+        // Process files that need indexing
+        let files_to_process: Vec<_> = files
+            .into_iter()
+            .filter(|f| !indexed_files.contains(f))
+            .collect();
 
-        let stored_hashes = self.storage.get_file_hashes(&file_paths)?;
+        // Process files in parallel batches for reading, but serialize DB writes
+        let batch_size = num_cpus::get().max(4);
 
-        let (to_process, to_delete): (Vec<_>, Vec<_>) = files
-            .into_par_iter()
-            .filter_map(|file_path| {
-                let file_path_str = file_path.to_string_lossy().to_string();
+        for batch in files_to_process.chunks(batch_size) {
+            // Process file data in parallel (reading and chunking)
+            let mut file_data_futures = Vec::new();
 
-                // Compute current hash for the file
-                let current_hash = match Self::compute_file_hash(&file_path) {
-                    Ok(hash) => hash,
-                    Err(_) => return None, // Skip files we can't read
-                };
+            for file_path in batch {
+                let path = file_path.clone();
+                let max_size = max_file_size;
 
-                match stored_hashes.get(&file_path_str) {
-                    Some(stored_hash) => {
-                        if &current_hash != stored_hash {
-                            Some((Some(file_path), Some(file_path_str)))
+                let future =
+                    task::spawn(
+                        async move { Self::process_file_data_static(&path, max_size).await },
+                    );
+
+                file_data_futures.push(future);
+            }
+
+            // Wait for all file processing to complete
+            let batch_results = futures::future::join_all(file_data_futures).await;
+
+            // Write results to database in parallel using batched writes
+            let write_futures: Vec<_> = batch_results
+                .into_iter()
+                .filter_map(|task_result| {
+                    if let Ok(Ok((chunks, file_index))) = task_result {
+                        if !chunks.is_empty() {
+                            Some((chunks, file_index))
                         } else {
                             None
                         }
+                    } else {
+                        None
                     }
-                    None => Some((Some(file_path), None)),
+                })
+                .map(|(chunks, file_index)| {
+                    let db_handle = self.db.clone_handle();
+                    let content_field = self.content_field;
+                    let path_field = self.path_field;
+                    let start_line_field = self.start_line_field;
+                    let end_line_field = self.end_line_field;
+
+                    task::spawn(async move {
+                        // Create batch for this file
+                        let mut batch = db_handle.create_batch();
+                        let mut docs = Vec::new();
+
+                        // Add chunks to batch
+                        for chunk in &chunks {
+                            let chunk_key = format!("chunk:{}", chunk.id);
+                            let chunk_data =
+                                bincode::encode_to_vec(chunk, bincode::config::standard())?;
+                            batch.put(chunk_key.as_bytes(), &chunk_data);
+
+                            let doc = doc!(
+                                content_field => chunk.content.clone(),
+                                path_field => chunk.file_path.to_string_lossy().to_string(),
+                                start_line_field => chunk.start_line as u64,
+                                end_line_field => chunk.end_line as u64,
+                            );
+                            docs.push(doc);
+                        }
+
+                        // Add file index to batch
+                        let file_key =
+                            format!("file_index:{}", file_index.file_path.to_string_lossy());
+                        let file_data =
+                            bincode::encode_to_vec(&file_index, bincode::config::standard())?;
+                        batch.put(file_key.as_bytes(), &file_data);
+
+                        // Write batch to database
+                        db_handle.put_batch(batch)?;
+
+                        Ok::<(Vec<tantivy::TantivyDocument>, usize), anyhow::Error>((
+                            docs,
+                            chunks.len(),
+                        ))
+                    })
+                })
+                .collect();
+
+            // Wait for all writes to complete
+            let write_results = futures::future::join_all(write_futures).await;
+
+            // Add documents to index in batches for better performance
+            let mut all_docs = Vec::new();
+            for write_result in write_results {
+                if let Ok(Ok((docs, chunk_count))) = write_result {
+                    total_chunks += chunk_count;
+                    all_docs.extend(docs);
                 }
-            })
-            .unzip();
+            }
 
-        let files_to_delete: Vec<String> = to_delete.into_iter().flatten().collect();
-        if !files_to_delete.is_empty() {
-            self.delete_chunks(&files_to_delete).await?;
+            // Batch add documents to index
+            for doc in all_docs {
+                self.index_writer.add_document(doc)?;
+            }
         }
 
-        Ok(to_process.into_iter().flatten().collect())
+        // Commit index changes
+        self.index_writer.commit()?;
+
+        Ok(total_chunks)
     }
 
-    async fn delete_chunks(&self, file_paths: &[String]) -> Result<()> {
-        if file_paths.is_empty() {
-            return Ok(());
-        }
-
-        self.storage.delete_chunks_for_files(file_paths)?;
-        self.search.remove_chunks_for_files(file_paths).await?;
-        Ok(())
-    }
-
-    fn process_file(
-        file_path: &PathBuf,
+    async fn process_file_data_static(
+        file_path: &Path,
         max_file_size: u64,
-        config: &ChunkConfig,
-    ) -> Vec<TextChunk> {
-        let content = match Self::load_file_content(file_path, max_file_size) {
-            Ok(content) => content,
-            Err(_) => return Vec::new(),
-        };
-
-        if content.trim().is_empty() {
-            return Vec::new();
-        }
-
-        // Compute file hash
-        let file_hash = match Self::compute_file_hash(file_path) {
-            Ok(hash) => hash,
-            Err(_) => return Vec::new(),
-        };
-
-        let content_len = content.len();
-        if content_len <= config.max_chunk_size {
-            let line_count = content.matches('\n').count() + 1;
-            return vec![TextChunk::new(
-                file_path.clone(),
-                0,
-                content,
-                1,
-                line_count,
-                Self::detect_language(file_path),
-                file_hash,
-            )];
-        }
-
-        let mut chunks = Vec::new();
-        let mut chunk_index = 0;
-        let mut current_chunk = String::with_capacity(config.max_chunk_size);
-        let mut chunk_start_line = 1;
-        let mut current_line = 1;
-        let language = Self::detect_language(file_path);
-
-        let lines = content.lines();
-        for line in lines {
-            let line_with_newline = format!("{}\n", line);
-
-            if current_chunk.len() + line_with_newline.len() > config.max_chunk_size
-                && !current_chunk.is_empty()
-            {
-                chunks.push(TextChunk::new(
-                    file_path.clone(),
-                    chunk_index,
-                    current_chunk,
-                    chunk_start_line,
-                    current_line - 1,
-                    language.clone(),
-                    file_hash.clone(),
-                ));
-
-                chunk_index += 1;
-                current_chunk = String::with_capacity(config.max_chunk_size);
-
-                if config.overlap_size > 0 {
-                    let overlap_lines = (config.overlap_size / 50).clamp(1, 5);
-                    current_chunk.push_str(&line_with_newline);
-                    chunk_start_line = current_line.saturating_sub(overlap_lines - 1);
-                } else {
-                    chunk_start_line = current_line;
-                }
-            }
-
-            if current_chunk.len() + line_with_newline.len() <= config.max_chunk_size {
-                current_chunk.push_str(&line_with_newline);
-            }
-
-            current_line += 1;
-        }
-
-        if !current_chunk.trim().is_empty() {
-            chunks.push(TextChunk::new(
-                file_path.clone(),
-                chunk_index,
-                current_chunk,
-                chunk_start_line,
-                current_line - 1,
-                language,
-                file_hash,
+    ) -> Result<(Vec<Chunk>, FileIndex)> {
+        // Check file size
+        let metadata = fs::metadata(file_path)?;
+        if metadata.len() > max_file_size {
+            return Ok((
+                Vec::new(),
+                FileIndex {
+                    file_path: file_path.to_owned(),
+                    hash: String::new(),
+                    last_modified: 0,
+                    chunk_count: 0,
+                    indexed_at: 0,
+                },
             ));
+        }
+
+        // Read file content
+        let content = task::spawn_blocking({
+            let file_path = file_path.to_owned();
+            move || fs::read_to_string(file_path)
+        })
+        .await??;
+
+        // Generate file hash
+        let mut hasher = Hasher::new();
+        hasher.update(content.as_bytes());
+        let file_hash = hasher.finalize().to_hex().to_string();
+
+        // Create chunks
+        let chunks =
+            Self::create_chunks_static(file_path, &content, &file_hash, &ChunkConfig::default());
+        let chunk_count = chunks.len();
+
+        // Create file index
+        let file_index = FileIndex {
+            file_path: file_path.to_owned(),
+            hash: file_hash,
+            last_modified: metadata
+                .modified()?
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+            chunk_count,
+            indexed_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
+        };
+
+        Ok((chunks, file_index))
+    }
+
+    fn create_chunks_static(
+        file_path: &Path,
+        content: &str,
+        file_hash: &str,
+        chunk_config: &ChunkConfig,
+    ) -> Vec<Chunk> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut chunks = Vec::new();
+        let mut current_pos = 0;
+        let mut chunk_id = 0;
+
+        while current_pos < content.len() {
+            let mut chunk_content = String::new();
+            let mut start_line = 0;
+            let mut end_line = 0;
+            let mut current_line = 0;
+            let mut char_count = 0;
+
+            // Find which line we're starting from
+            let mut line_start_pos = 0;
+            for (line_idx, line) in lines.iter().enumerate() {
+                if line_start_pos + line.len() + 1 > current_pos {
+                    start_line = line_idx + 1;
+                    current_line = line_idx;
+                    break;
+                }
+                line_start_pos += line.len() + 1;
+            }
+
+            // Build chunk content
+            while current_line < lines.len() && char_count < chunk_config.chunk_size {
+                if !chunk_content.is_empty() {
+                    chunk_content.push('\n');
+                    char_count += 1;
+                }
+
+                let line = lines[current_line];
+                chunk_content.push_str(line);
+                char_count += line.len();
+                end_line = current_line + 1;
+                current_line += 1;
+            }
+
+            // Skip if chunk is too small
+            if chunk_content.len() < chunk_config.min_chunk_size {
+                break;
+            }
+
+            // Create chunk
+            let chunk = Chunk {
+                id: format!("{}:{}", file_hash, chunk_id),
+                file_path: file_path.to_owned(),
+                start_line,
+                end_line,
+                content: chunk_content.clone(),
+                hash: {
+                    let mut hasher = Hasher::new();
+                    hasher.update(chunk_content.as_bytes());
+                    hasher.finalize().to_hex().to_string()
+                },
+            };
+
+            chunks.push(chunk);
+            chunk_id += 1;
+
+            // Move position forward, accounting for overlap
+            let overlap_chars = chunk_config.overlap_size.min(chunk_content.len() / 2);
+            current_pos += chunk_content.len() - overlap_chars;
         }
 
         chunks
     }
 
-    fn detect_language(file_path: &Path) -> Option<String> {
-        file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| {
-                match ext.to_lowercase().as_str() {
-                    "rs" => "rust",
-                    "py" => "python",
-                    "js" => "javascript",
-                    "ts" => "typescript",
-                    "java" => "java",
-                    "c" => "c",
-                    "cpp" | "cc" | "cxx" => "cpp",
-                    "go" => "go",
-                    "rb" => "ruby",
-                    "php" => "php",
-                    "html" => "html",
-                    "css" => "css",
-                    "json" => "json",
-                    "xml" => "xml",
-                    "yaml" | "yml" => "yaml",
-                    "md" | "markdown" => "markdown",
-                    _ => "text",
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<(Chunk, f32)>> {
+        let searcher = self.index_reader.searcher();
+        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
+
+        let query = query_parser.parse_query(query)?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        let mut results = Vec::new();
+
+        for (score, doc_address) in top_docs {
+            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+
+            if let Some(path_value) = retrieved_doc.get_first(self.path_field) {
+                if let Some(start_line_value) = retrieved_doc.get_first(self.start_line_field) {
+                    if let Some(end_line_value) = retrieved_doc.get_first(self.end_line_field) {
+                        let path_str = match path_value {
+                            OwnedValue::Str(s) => s,
+                            _ => "",
+                        };
+                        let start_line = match start_line_value {
+                            OwnedValue::U64(n) => *n as usize,
+                            _ => 0,
+                        };
+                        let end_line = match end_line_value {
+                            OwnedValue::U64(n) => *n as usize,
+                            _ => 0,
+                        };
+
+                        // Try to find the corresponding chunk in the database
+                        // This is a simplified approach - in production you'd want a more efficient lookup
+                        let file_path = PathBuf::from(path_str);
+                        if let Ok(content) = fs::read_to_string(&file_path) {
+                            let mut hasher = Hasher::new();
+                            hasher.update(content.as_bytes());
+                            let file_hash = hasher.finalize().to_hex().to_string();
+
+                            // Try to find matching chunk
+                            for chunk_id in 0..100 {
+                                // arbitrary limit
+                                let chunk_key = format!("chunk:{}:{}", file_hash, chunk_id);
+                                if let Ok(Some(chunk_data)) = self.db.get(chunk_key.as_bytes()) {
+                                    if let Ok((chunk, _)) = bincode::decode_from_slice::<Chunk, _>(
+                                        &chunk_data,
+                                        bincode::config::standard(),
+                                    ) {
+                                        if chunk.start_line == start_line
+                                            && chunk.end_line == end_line
+                                        {
+                                            results.push((chunk, score));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                .to_string()
-            })
-    }
-
-    pub async fn clear_all_chunks(&self) -> Result<()> {
-        self.storage.clear_all_chunks().await?;
-        self.search.clear_index().await?;
-        Ok(())
-    }
-
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        self.search.search(query, limit).await
-    }
-
-    pub async fn close(self) {
-        self.storage.close().await;
-    }
-
-    /// Compute a hash for a file based on its content
-    fn compute_file_hash(file_path: &Path) -> Result<String> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let content = std::fs::read_to_string(file_path)?;
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        Ok(format!("{:x}", hasher.finish()))
-    }
-
-    /// Load file content with optimized reading for large files
-    fn load_file_content(path: &Path, max_size: u64) -> Result<String> {
-        let metadata = std::fs::metadata(path)?;
-
-        if metadata.len() == 0 {
-            return Ok(String::new());
-        }
-
-        // For large files, use buffered reading
-        if metadata.len() > 2 * 1024 * 1024 {
-            use std::io::BufRead;
-            let file = std::fs::File::open(path)?;
-            let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
-
-            let mut content =
-                String::with_capacity((metadata.len() as usize).min(max_size as usize));
-            let mut buffer = String::with_capacity(16384);
-
-            while reader.read_line(&mut buffer)? > 0 {
-                content.push_str(&buffer);
-                buffer.clear();
             }
-            Ok(content)
-        } else {
-            // For small files
-            std::fs::read_to_string(path).context("Failed to read file")
         }
+
+        Ok(results)
+    }
+
+    pub async fn close(mut self) {
+        // Commit any pending changes
+        let _ = self.index_writer.commit();
     }
 }

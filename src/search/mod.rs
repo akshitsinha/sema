@@ -1,4 +1,4 @@
-use crate::types::TextChunk;
+use crate::types::Chunk;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
@@ -14,10 +14,11 @@ use tantivy::{
 /// Search result containing a chunk and its relevance score
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    pub chunk: TextChunk,
+    pub chunk: Chunk,
     pub score: f32,
     pub snippet: String,
     pub highlighted_content: String,
+    pub total_matches_in_file: usize,
 }
 
 /// Search service for full-text search using Tantivy
@@ -81,7 +82,7 @@ impl SearchService {
     }
 
     /// Index chunks for search
-    pub async fn index_chunks(&self, chunks: &[TextChunk]) -> Result<()> {
+    pub async fn index_chunks(&self, chunks: &[Chunk]) -> Result<()> {
         let mut writer = self.writer.write();
 
         let file_path_field = self.schema.get_field("file_path").unwrap();
@@ -92,13 +93,21 @@ impl SearchService {
         let file_hash_field = self.schema.get_field("file_hash").unwrap();
 
         for chunk in chunks {
+            // Extract chunk index from id (format: "file_hash:chunk_index")
+            let chunk_index = chunk
+                .id
+                .split(':')
+                .next_back()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
             let doc = doc!(
                 file_path_field => chunk.file_path.to_string_lossy().as_ref(),
                 content_field => chunk.content.as_str(),
-                chunk_index_field => chunk.chunk_index as u64,
+                chunk_index_field => chunk_index,
                 start_line_field => chunk.start_line as u64,
                 end_line_field => chunk.end_line as u64,
-                file_hash_field => chunk.file_hash.as_str()
+                file_hash_field => chunk.hash.as_str()
             );
 
             writer.add_document(doc)?;
@@ -208,14 +217,13 @@ impl SearchService {
                 .unwrap_or("")
                 .to_string();
 
-            let chunk = TextChunk {
-                id: None,
+            let chunk = Chunk {
+                id: format!("{}:{}", file_hash, chunk_index),
                 file_path: PathBuf::from(file_path),
-                chunk_index,
-                content: content.clone(),
                 start_line,
                 end_line,
-                file_hash,
+                content: content.clone(),
+                hash: file_hash,
             };
 
             // Create snippet and highlighted content
@@ -227,6 +235,7 @@ impl SearchService {
                 score,
                 snippet,
                 highlighted_content,
+                total_matches_in_file: 1, // Will be updated in grouping
             });
         }
 

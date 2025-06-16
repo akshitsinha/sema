@@ -1,6 +1,6 @@
 pub mod app;
-pub mod components;
-pub mod handlers;
-pub mod utils;
+pub mod engine;
+pub mod events;
+pub mod ui;
 
 pub use app::*;
