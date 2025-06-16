@@ -15,15 +15,22 @@ impl Database {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
-        // Enable multithreading options
-        opts.set_max_background_jobs(6);
-        opts.set_max_write_buffer_number(4);
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
-        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB
-        opts.set_level_zero_file_num_compaction_trigger(4);
-        opts.set_level_zero_slowdown_writes_trigger(20);
-        opts.set_level_zero_stop_writes_trigger(36);
-        opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB
+        // More aggressive multithreading options for maximum write performance
+        let cpu_count = num_cpus::get() as i32;
+        opts.set_max_background_jobs((cpu_count * 2).max(8));
+        opts.set_max_write_buffer_number(8); // More write buffers
+        opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB - larger buffers
+        opts.set_target_file_size_base(128 * 1024 * 1024); // 128MB
+        opts.set_level_zero_file_num_compaction_trigger(8); // More aggressive compaction
+        opts.set_level_zero_slowdown_writes_trigger(32);
+        opts.set_level_zero_stop_writes_trigger(64);
+        opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB
+
+        // Additional performance optimizations
+        opts.set_allow_concurrent_memtable_write(true);
+        opts.set_enable_write_thread_adaptive_yield(true);
+        opts.set_max_open_files(10000); // Keep more files open
+        opts.set_use_direct_io_for_flush_and_compaction(true); // Skip OS cache for compaction
 
         let db = Arc::new(DB::open(&opts, path)?);
 
