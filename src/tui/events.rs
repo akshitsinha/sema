@@ -1,5 +1,4 @@
-use crate::search::SearchResult;
-use crate::types::UIMode;
+use crate::types::{SearchResult, UIMode};
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub enum EventResult {

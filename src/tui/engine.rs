@@ -6,9 +6,10 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::search::SearchResult;
 use crate::storage::service::ProcessingService;
-use crate::types::{AppState as AppStateEnum, ChunkConfig, CrawlerConfig, FocusedWindow, UIMode};
+use crate::types::{
+    AppState as AppStateEnum, ChunkConfig, CrawlerConfig, FocusedWindow, SearchResult, UIMode,
+};
 
 const SEARCH_RESULTS_LIMIT: usize = 50;
 

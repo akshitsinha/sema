@@ -123,13 +123,12 @@ impl ProcessingService {
             .collect();
 
         // Process files in parallel batches with higher concurrency
-        let batch_size = (num_cpus::get() * 2).max(8).min(32); // More aggressive batching
+        let batch_size = (num_cpus::get() * 2).clamp(8, 32); // More aggressive batching
 
         // Process multiple batches in parallel for maximum throughput
         let batch_futures: Vec<_> = files_to_process
             .chunks(batch_size)
-            .enumerate()
-            .map(|(_, batch)| {
+            .map(|batch| {
                 let batch = batch.to_vec();
                 let max_size = max_file_size;
                 let db_handle = self.db.clone_handle();
@@ -145,11 +144,8 @@ impl ProcessingService {
                     // Process all files in this batch concurrently
                     let file_futures: Vec<_> = batch
                         .into_iter()
-                        .map(|file_path| {
-                            let max_size = max_size;
-                            async move {
-                                Self::process_file_data_static(&file_path, max_size).await
-                            }
+                        .map(|file_path| async move {
+                            Self::process_file(&file_path, max_size).await.ok()
                         })
                         .collect();
 
@@ -158,39 +154,33 @@ impl ProcessingService {
                     // Prepare database batch and documents
                     let mut db_batch = db_handle.create_batch();
 
-                    for result in file_results {
-                        if let Ok((chunks, file_index)) = result {
-                            if !chunks.is_empty() {
-                                batch_chunk_count += chunks.len();
+                    for (chunks, file_index) in file_results.into_iter().flatten() {
+                        if !chunks.is_empty() {
+                            batch_chunk_count += chunks.len();
 
-                                // Add chunks to database batch
-                                for chunk in &chunks {
-                                    let chunk_key = format!("chunk:{}", chunk.id);
-                                    let chunk_data =
-                                        bincode::encode_to_vec(chunk, bincode::config::standard())?;
-                                    db_batch.put(chunk_key.as_bytes(), &chunk_data);
+                            // Add chunks to database batch
+                            for chunk in &chunks {
+                                let chunk_key = format!("chunk:{}", chunk.id);
+                                let chunk_data =
+                                    bincode::encode_to_vec(chunk, bincode::config::standard())?;
+                                db_batch.put(chunk_key.as_bytes(), &chunk_data);
 
-                                    // Prepare index document
-                                    let doc = doc!(
-                                        content_field => chunk.content.clone(),
-                                        path_field => chunk.file_path.to_string_lossy().to_string(),
-                                        start_line_field => chunk.start_line as u64,
-                                        end_line_field => chunk.end_line as u64,
-                                    );
-                                    batch_docs.push(doc);
-                                }
-
-                                // Add file index to batch
-                                let file_key = format!(
-                                    "file_index:{}",
-                                    file_index.file_path.to_string_lossy()
+                                // Prepare index document
+                                let doc = doc!(
+                                    content_field => chunk.content.clone(),
+                                    path_field => chunk.file_path.to_string_lossy().to_string(),
+                                    start_line_field => chunk.start_line as u64,
+                                    end_line_field => chunk.end_line as u64,
                                 );
-                                let file_data = bincode::encode_to_vec(
-                                    &file_index,
-                                    bincode::config::standard(),
-                                )?;
-                                db_batch.put(file_key.as_bytes(), &file_data);
+                                batch_docs.push(doc);
                             }
+
+                            // Add file index to batch
+                            let file_key =
+                                format!("file_index:{}", file_index.file_path.to_string_lossy());
+                            let file_data =
+                                bincode::encode_to_vec(&file_index, bincode::config::standard())?;
+                            db_batch.put(file_key.as_bytes(), &file_data);
                         }
                     }
 
@@ -210,14 +200,12 @@ impl ProcessingService {
         // Wait for all batches to complete and collect results
         let batch_results = futures::future::join_all(batch_futures).await;
 
-        for batch_result in batch_results {
-            if let Ok(Ok((docs, chunk_count))) = batch_result {
-                total_chunks += chunk_count;
+        for (docs, chunk_count) in batch_results.into_iter().flatten().flatten() {
+            total_chunks += chunk_count;
 
-                // Add documents to index in bulk
-                for doc in docs {
-                    self.index_writer.add_document(doc)?;
-                }
+            // Add documents to index in bulk
+            for doc in docs {
+                self.index_writer.add_document(doc)?;
             }
         }
 
@@ -227,10 +215,7 @@ impl ProcessingService {
         Ok(total_chunks)
     }
 
-    async fn process_file_data_static(
-        file_path: &Path,
-        max_file_size: u64,
-    ) -> Result<(Vec<Chunk>, FileIndex)> {
+    async fn process_file(file_path: &Path, max_file_size: u64) -> Result<(Vec<Chunk>, FileIndex)> {
         // Check file size
         let metadata = fs::metadata(file_path)?;
         if metadata.len() > max_file_size {
@@ -277,8 +262,7 @@ impl ProcessingService {
         let file_hash = hasher.finalize().to_hex().to_string();
 
         // Create chunks
-        let chunks =
-            Self::create_chunks_static(file_path, &content, &file_hash, &ChunkConfig::default());
+        let chunks = Self::chunk(file_path, &content, &file_hash, &ChunkConfig::default());
         let chunk_count = chunks.len();
 
         // Create file index
@@ -297,7 +281,7 @@ impl ProcessingService {
 
         Ok((chunks, file_index))
     }
-    fn create_chunks_static(
+    fn chunk(
         file_path: &Path,
         content: &str,
         file_hash: &str,
@@ -387,6 +371,18 @@ impl ProcessingService {
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<(Chunk, f32)>> {
+        // Only search if query starts with '
+        let query = query.trim();
+        if !query.starts_with('\'') {
+            return Ok(Vec::new());
+        }
+
+        // Remove the ' prefix
+        let query = &query[1..];
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let searcher = self.index_reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
 
@@ -401,16 +397,20 @@ impl ProcessingService {
             if let Some(path_value) = retrieved_doc.get_first(self.path_field) {
                 if let Some(start_line_value) = retrieved_doc.get_first(self.start_line_field) {
                     if let Some(end_line_value) = retrieved_doc.get_first(self.end_line_field) {
-                        let path_str = match path_value {
+                        let owned_path = OwnedValue::from(path_value);
+                        let owned_start = OwnedValue::from(start_line_value);
+                        let owned_end = OwnedValue::from(end_line_value);
+
+                        let path_str = match owned_path {
                             OwnedValue::Str(s) => s,
-                            _ => "",
+                            _ => String::new(),
                         };
-                        let start_line = match start_line_value {
-                            OwnedValue::U64(n) => *n as usize,
+                        let start_line = match owned_start {
+                            OwnedValue::U64(n) => n as usize,
                             _ => 0,
                         };
-                        let end_line = match end_line_value {
-                            OwnedValue::U64(n) => *n as usize,
+                        let end_line = match owned_end {
+                            OwnedValue::U64(n) => n as usize,
                             _ => 0,
                         };
 

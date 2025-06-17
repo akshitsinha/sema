@@ -102,3 +102,12 @@ pub struct FileIndex {
     pub chunk_count: usize,
     pub indexed_at: u64,
 }
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub chunk: Chunk,
+    pub score: f32,
+    pub snippet: String,
+    pub highlighted_content: String,
+    pub total_matches_in_file: usize,
+}
