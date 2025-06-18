@@ -49,6 +49,7 @@ impl From<&crate::config::GeneralConfig> for CrawlerConfig {
 pub enum AppState {
     Crawling,
     Chunking,
+    GeneratingEmbeddings,
     Ready,
     Searching,
 }

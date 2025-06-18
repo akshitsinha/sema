@@ -61,6 +61,10 @@ impl Database {
         WriteBatch::default()
     }
 
+    pub fn iterator(&self) -> rocksdb::DBIterator {
+        self.db.iterator(rocksdb::IteratorMode::Start)
+    }
+
     // Clone for concurrent access - RocksDB handles thread safety internally
     pub fn clone_handle(&self) -> Self {
         Self {

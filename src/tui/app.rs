@@ -147,6 +147,17 @@ impl App {
                 } => {
                     self.engine.processing_stats = Some((chunks_count, duration_secs));
                     self.engine.data_changed = true;
+                    // Don't set to Ready yet - embedding generation will start
+                }
+                StateUpdate::EmbeddingStarted => {
+                    self.engine.data_changed = true;
+                }
+                StateUpdate::EmbeddingCompleted {
+                    chunks_count,
+                    duration_secs,
+                } => {
+                    self.engine.embedding_stats = Some((chunks_count, duration_secs));
+                    self.engine.data_changed = true;
                     self.engine.app_state.state = crate::types::AppState::Ready;
                     self.engine.ui_mode = crate::types::UIMode::SearchInput;
                     self.engine.update_focused_window();
@@ -306,7 +317,9 @@ impl App {
     fn should_update_spinner(&self) -> bool {
         matches!(
             self.engine.app_state.state,
-            crate::types::AppState::Crawling | crate::types::AppState::Chunking
+            crate::types::AppState::Crawling
+                | crate::types::AppState::Chunking
+                | crate::types::AppState::GeneratingEmbeddings
         )
     }
 }

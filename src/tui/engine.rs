@@ -6,7 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::storage::service::ProcessingService;
+use crate::semantic::index::SemanticIndex;
+use crate::storage::{Database, service::ProcessingService};
 use crate::types::{
     AppState as AppStateEnum, ChunkConfig, CrawlerConfig, FocusedWindow, SearchResult, UIMode,
 };
@@ -29,6 +30,11 @@ pub enum StateUpdate {
         duration_secs: f64,
     },
     ProcessingCompleted {
+        chunks_count: usize,
+        duration_secs: f64,
+    },
+    EmbeddingStarted,
+    EmbeddingCompleted {
         chunks_count: usize,
         duration_secs: f64,
     },
@@ -61,6 +67,7 @@ pub struct Engine {
     // Stats
     pub crawling_stats: Option<(usize, f64)>,
     pub processing_stats: Option<(usize, f64)>,
+    pub embedding_stats: Option<(usize, f64)>,
     pub timing_shown: bool,
 
     // Services
@@ -100,6 +107,7 @@ impl Engine {
 
             crawling_stats: None,
             processing_stats: None,
+            embedding_stats: None,
             timing_shown: false,
             processing_service: None,
 
@@ -194,23 +202,89 @@ impl Engine {
                 }
             };
 
-        match processing_service.process_files(files, max_file_size).await {
-            Ok(chunks_count) => {
-                let processing_duration = processing_start_time.elapsed().as_secs_f64();
+        let should_start_embeddings =
+            match processing_service.process_files(files, max_file_size).await {
+                Ok(chunks_count) => {
+                    let processing_duration = processing_start_time.elapsed().as_secs_f64();
 
-                let _ = state_tx.send(StateUpdate::ProcessingCompleted {
-                    chunks_count,
-                    duration_secs: processing_duration,
-                });
-
-                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-            }
-            Err(_e) => {
-                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-            }
-        }
+                    let _ = state_tx.send(StateUpdate::ProcessingCompleted {
+                        chunks_count,
+                        duration_secs: processing_duration,
+                    });
+                    true
+                }
+                Err(_e) => {
+                    let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                    false
+                }
+            };
 
         processing_service.close().await;
+
+        // Start embedding generation after processing service is closed
+        if should_start_embeddings {
+            Self::start_embedding_generation(state_tx.clone(), config_dir.clone()).await;
+        }
+    }
+
+    pub async fn start_embedding_generation(
+        state_tx: mpsc::UnboundedSender<StateUpdate>,
+        config_dir: PathBuf,
+    ) {
+        // Generate embeddings phase
+        let _ = state_tx.send(StateUpdate::StateChanged(
+            AppStateEnum::GeneratingEmbeddings,
+        ));
+        let _ = state_tx.send(StateUpdate::EmbeddingStarted);
+
+        // Get total number of chunks from database
+        let db_path = config_dir.join("db");
+        let db = match Database::new(&db_path) {
+            Ok(db) => db,
+            Err(_) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                return;
+            }
+        };
+
+        let total_chunks = match Self::count_chunks_in_db(&db) {
+            Ok(count) => count,
+            Err(_) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                return;
+            }
+        };
+
+        // Initialize SemanticIndex with proper configurations
+        let mut semantic_index = match SemanticIndex::new(&config_dir, total_chunks) {
+            Ok(index) => index,
+            Err(_) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                return;
+            }
+        };
+
+        let embedding_start_time = Instant::now();
+
+        // Process all chunks and store embeddings in usearch index
+        if let Err(_) = semantic_index.process_all_chunks(&db) {
+            let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+            return;
+        }
+
+        // Save the index to disk
+        if semantic_index.save().is_err() {
+            let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+            return;
+        }
+
+        let embedding_duration = embedding_start_time.elapsed().as_secs_f64();
+        let _ = state_tx.send(StateUpdate::EmbeddingCompleted {
+            chunks_count: total_chunks,
+            duration_secs: embedding_duration,
+        });
+
+        let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
     }
 
     // Search functionality
@@ -221,6 +295,7 @@ impl Engine {
         // Clear timing stats once a search is performed
         self.crawling_stats = None;
         self.processing_stats = None;
+        self.embedding_stats = None;
 
         // Initialize processing service if needed
         if self.processing_service.is_none() {
@@ -338,5 +413,25 @@ impl Engine {
         // Position the view to start exactly at the beginning of the chunk
         // The chunk.start_line is 1-based, but scroll offset is 0-based
         search_result.chunk.start_line.saturating_sub(1)
+    }
+
+    fn count_chunks_in_db(db: &Database) -> Result<usize> {
+        let mut count = 0;
+        let iterator = db.iterator();
+
+        for item in iterator {
+            match item {
+                Ok((key, _)) => {
+                    if let Ok(key_str) = String::from_utf8(key.to_vec()) {
+                        if key_str.starts_with("chunk:") && !key_str.contains("file_index:") {
+                            count += 1;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(count)
     }
 }

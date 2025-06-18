@@ -29,6 +29,9 @@ impl UI {
             AppStateEnum::Crawling | AppStateEnum::Chunking | AppStateEnum::Ready => {
                 Self::render_main_interface(f, area, engine);
             }
+            AppStateEnum::GeneratingEmbeddings => {
+                Self::render_main_interface(f, area, engine);
+            }
             AppStateEnum::Searching => Self::render_main_interface(f, area, engine),
         }
     }
@@ -69,6 +72,7 @@ impl UI {
             &engine.search_input,
             &engine.crawling_stats,
             &engine.processing_stats,
+            &engine.embedding_stats,
         );
 
         let status_block = Block::default()
@@ -479,6 +483,7 @@ impl UI {
         search_input: &str,
         crawling_stats: &Option<(usize, f64)>,
         processing_stats: &Option<(usize, f64)>,
+        embedding_stats: &Option<(usize, f64)>,
     ) -> (String, &'static str) {
         match state {
             AppStateEnum::Crawling => {
@@ -493,6 +498,13 @@ impl UI {
                 (
                     format!(" {} Processing files... ", spinner_char),
                     "Breaking files into searchable chunks.\nAlmost ready for search!",
+                )
+            }
+            AppStateEnum::GeneratingEmbeddings => {
+                let spinner_char = Self::get_spinner_char(spinner_frame);
+                (
+                    format!(" {} Generating embeddings... ", spinner_char),
+                    "Creating semantic embeddings for search.\nAlmost ready for semantic search!",
                 )
             }
             AppStateEnum::Ready => {
@@ -532,9 +544,26 @@ impl UI {
                                 proc_time_value,
                                 proc_time_unit
                             );
+
+                            if let Some((emb_count, emb_duration)) = embedding_stats {
+                                let emb_time_unit =
+                                    if *emb_duration < 1.0 { "ms" } else { "seconds" };
+                                let emb_time_value = if *emb_duration < 1.0 {
+                                    emb_duration * 1000.0
+                                } else {
+                                    *emb_duration
+                                };
+                                title = format!(
+                                    "{} - Generated {} embeddings in {:.1} {}",
+                                    title.trim_end(),
+                                    emb_count,
+                                    emb_time_value,
+                                    emb_time_unit
+                                );
+                            }
                         }
 
-                        message = "Processing completed!\nType your search query and press Enter to search.";
+                        message = "Processing completed! Semantic search ready.\nType your search query and press Enter to search.";
                     }
 
                     (title, message)

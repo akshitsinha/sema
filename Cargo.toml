@@ -64,3 +64,7 @@ uuid = { version = "1.17.0", features = ["v4"] }
 # Performance utilities
 rayon = "1.10.0"
 dashmap = "6.1.0"
+
+# Semantic search
+fastembed = "4.9.1"
+usearch = "2.17.12"
