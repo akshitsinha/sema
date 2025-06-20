@@ -319,6 +319,7 @@ impl App {
             self.engine.app_state.state,
             crate::types::AppState::Crawling
                 | crate::types::AppState::Chunking
+                | crate::types::AppState::DownloadingModel
                 | crate::types::AppState::GeneratingEmbeddings
         )
     }

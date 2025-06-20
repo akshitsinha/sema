@@ -29,6 +29,9 @@ impl UI {
             AppStateEnum::Crawling | AppStateEnum::Chunking | AppStateEnum::Ready => {
                 Self::render_main_interface(f, area, engine);
             }
+            AppStateEnum::DownloadingModel => {
+                Self::render_main_interface(f, area, engine);
+            }
             AppStateEnum::GeneratingEmbeddings => {
                 Self::render_main_interface(f, area, engine);
             }
@@ -184,12 +187,8 @@ impl UI {
                 let actual_index = start_index + i;
                 let is_selected = actual_index == engine.selected_search_result;
 
-                let file_name = result
-                    .chunk
-                    .file_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
+                let file_display_path =
+                    Self::get_display_path(&result.chunk.file_path, &engine.root_path);
 
                 let (results_count, line_range) = if result.total_matches_in_file > 1 {
                     (
@@ -234,7 +233,10 @@ impl UI {
                 };
 
                 ListItem::new(vec![
-                    Line::from(vec![Span::styled(file_name.to_string(), filename_style)]),
+                    Line::from(vec![Span::styled(
+                        file_display_path.to_string(),
+                        filename_style,
+                    )]),
                     info_line,
                     Line::from(vec![Span::styled(
                         "─".repeat(available_width),
@@ -256,12 +258,8 @@ impl UI {
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
         if let Some(selected_result) = engine.search_results.get(engine.selected_search_result) {
-            let file_name = selected_result
-                .chunk
-                .file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+            let file_display_path =
+                Self::get_display_path(&selected_result.chunk.file_path, &engine.root_path);
 
             // Use cached file content if available, otherwise fall back to chunk content
             let content_to_display = if let Some(ref cached_content) = engine.cached_file_content {
@@ -282,11 +280,13 @@ impl UI {
             let title = if engine.cached_file_content.is_some()
                 && engine.cached_file_path.as_ref() == Some(&selected_result.chunk.file_path)
             {
-                format!(" {} ", file_name)
+                format!(" {} ", file_display_path)
             } else {
                 format!(
                     " {} (Lines {}-{}) ",
-                    file_name, selected_result.chunk.start_line, selected_result.chunk.end_line
+                    file_display_path,
+                    selected_result.chunk.start_line,
+                    selected_result.chunk.end_line
                 )
             };
 
@@ -308,6 +308,13 @@ impl UI {
                 engine.file_preview_scroll_offset,
                 area.height.saturating_sub(2) as usize,
                 &engine.current_search_query,
+                if engine.cached_file_content.is_some()
+                    && engine.cached_file_path.as_ref() == Some(&selected_result.chunk.file_path)
+                {
+                    None // Don't pass chunk info when showing full file
+                } else {
+                    Some(&selected_result.chunk) // Pass chunk info when showing chunk only
+                },
             );
 
             let preview_para = Paragraph::new(content_lines)
@@ -343,6 +350,7 @@ impl UI {
         scroll_offset: usize,
         visible_lines: usize,
         search_query: &str,
+        _chunk: Option<&crate::types::Chunk>,
     ) -> Vec<Line<'static>> {
         let extension = file_path
             .extension()
@@ -357,10 +365,23 @@ impl UI {
         let theme = &THEME_SET.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
-        let search_terms: Vec<&str> = search_query
-            .split_whitespace()
-            .filter(|term| !term.is_empty())
-            .collect();
+        // Determine if this is semantic search vs text search
+        let is_semantic_search = !search_query.trim().starts_with('\'');
+
+        let search_terms: Vec<&str> = if is_semantic_search {
+            // For semantic search, don't highlight query terms
+            Vec::new()
+        } else {
+            // For text search, highlight query terms (remove the ' prefix)
+            let query = search_query
+                .trim()
+                .strip_prefix('\'')
+                .unwrap_or(search_query);
+            query
+                .split_whitespace()
+                .filter(|term| !term.is_empty())
+                .collect()
+        };
 
         let total_lines = content.lines().count();
         let line_number_width = (total_lines + scroll_offset).to_string().len().max(3);
@@ -374,56 +395,100 @@ impl UI {
                 let line_number = line_index + 1;
                 let line_num_str = format!("{:>width$} │ ", line_number, width = line_number_width);
 
-                match highlighter.highlight_line(line, &SYNTAX_SET) {
-                    Ok(ranges) => {
-                        // Apply syntax highlighting first
-                        let mut spans: Vec<Span> = vec![Span::styled(
-                            line_num_str,
-                            Style::default().fg(Color::DarkGray),
-                        )];
+                // Skip semantic term highlighting for semantic search
+                if is_semantic_search {
+                    // Use syntax highlighting but no semantic highlighting
+                    match highlighter.highlight_line(line, &SYNTAX_SET) {
+                        Ok(ranges) => {
+                            // Apply syntax highlighting only
+                            let mut spans: Vec<Span> = vec![Span::styled(
+                                line_num_str,
+                                Style::default().fg(Color::DarkGray),
+                            )];
 
-                        let content_spans: Vec<Span> = ranges
-                            .iter()
-                            .map(|(style, text)| {
-                                let fg_color = Color::Rgb(
-                                    style.foreground.r,
-                                    style.foreground.g,
-                                    style.foreground.b,
-                                );
-                                Span::styled(text.to_string(), Style::default().fg(fg_color))
-                            })
-                            .collect();
+                            let content_spans: Vec<Span> = ranges
+                                .iter()
+                                .map(|(style, text)| {
+                                    let fg_color = Color::Rgb(
+                                        style.foreground.r,
+                                        style.foreground.g,
+                                        style.foreground.b,
+                                    );
+                                    Span::styled(text.to_string(), Style::default().fg(fg_color))
+                                })
+                                .collect();
 
-                        spans.extend(content_spans);
-
-                        // Apply search highlighting on top of syntax highlighting
-                        if !search_terms.is_empty() {
-                            let (line_num_span, content_spans) = spans.split_first().unwrap();
-                            let highlighted_content =
-                                Self::highlight_search_terms(content_spans.to_vec(), &search_terms);
-                            let mut final_spans = vec![line_num_span.clone()];
-                            final_spans.extend(highlighted_content);
-                            Line::from(final_spans)
-                        } else {
+                            spans.extend(content_spans);
+                            Line::from(spans)
+                        }
+                        Err(_) => {
+                            // Fallback: plain text
+                            let spans = vec![
+                                Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
+                                Span::styled(line.to_string(), Style::default()),
+                            ];
                             Line::from(spans)
                         }
                     }
-                    Err(_) => {
-                        // Fallback: plain text with search highlighting
-                        let spans = vec![
-                            Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
-                            Span::styled(line.to_string(), Style::default()),
-                        ];
+                } else {
+                    // Use syntax highlighting for text search
+                    match highlighter.highlight_line(line, &SYNTAX_SET) {
+                        Ok(ranges) => {
+                            // Apply syntax highlighting first
+                            let mut spans: Vec<Span> = vec![Span::styled(
+                                line_num_str,
+                                Style::default().fg(Color::DarkGray),
+                            )];
 
-                        if !search_terms.is_empty() {
-                            let (line_num_span, content_spans) = spans.split_first().unwrap();
-                            let highlighted_content =
-                                Self::highlight_search_terms(content_spans.to_vec(), &search_terms);
-                            let mut final_spans = vec![line_num_span.clone()];
-                            final_spans.extend(highlighted_content);
-                            Line::from(final_spans)
-                        } else {
-                            Line::from(spans)
+                            let content_spans: Vec<Span> = ranges
+                                .iter()
+                                .map(|(style, text)| {
+                                    let fg_color = Color::Rgb(
+                                        style.foreground.r,
+                                        style.foreground.g,
+                                        style.foreground.b,
+                                    );
+                                    Span::styled(text.to_string(), Style::default().fg(fg_color))
+                                })
+                                .collect();
+
+                            spans.extend(content_spans);
+
+                            // Apply highlighting based on search type
+                            if !search_terms.is_empty() {
+                                // Text search: highlight query terms
+                                let (line_num_span, content_spans) = spans.split_first().unwrap();
+                                let highlighted_content = Self::highlight_search_terms(
+                                    content_spans.to_vec(),
+                                    &search_terms,
+                                );
+                                let mut final_spans = vec![line_num_span.clone()];
+                                final_spans.extend(highlighted_content);
+                                Line::from(final_spans)
+                            } else {
+                                Line::from(spans)
+                            }
+                        }
+                        Err(_) => {
+                            // Fallback: plain text with highlighting
+                            let spans = vec![
+                                Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
+                                Span::styled(line.to_string(), Style::default()),
+                            ];
+
+                            if !search_terms.is_empty() {
+                                // Text search: highlight query terms
+                                let (line_num_span, content_spans) = spans.split_first().unwrap();
+                                let highlighted_content = Self::highlight_search_terms(
+                                    content_spans.to_vec(),
+                                    &search_terms,
+                                );
+                                let mut final_spans = vec![line_num_span.clone()];
+                                final_spans.extend(highlighted_content);
+                                Line::from(final_spans)
+                            } else {
+                                Line::from(spans)
+                            }
                         }
                     }
                 }
@@ -498,6 +563,13 @@ impl UI {
                 (
                     format!(" {} Processing files... ", spinner_char),
                     "Breaking files into searchable chunks.\nAlmost ready for search!",
+                )
+            }
+            AppStateEnum::DownloadingModel => {
+                let spinner_char = Self::get_spinner_char(spinner_frame);
+                (
+                    format!(" {} Downloading model... ", spinner_char),
+                    "Downloading embedding model from Hugging Face.\nThis may take a while on first run.",
                 )
             }
             AppStateEnum::GeneratingEmbeddings => {
@@ -651,5 +723,37 @@ impl UI {
         }
 
         result
+    }
+
+    fn get_display_path(file_path: &std::path::Path, base_dir: &std::path::Path) -> String {
+        // Try to get a relative path from base directory
+        if let Ok(relative) = file_path.strip_prefix(base_dir) {
+            relative.to_string_lossy().to_string()
+        } else {
+            // Fall back to showing the last 2 components if possible and not too long
+            let components: Vec<_> = file_path.components().collect();
+            if components.len() >= 2 {
+                let parent = components[components.len() - 2]
+                    .as_os_str()
+                    .to_string_lossy();
+                let filename = components[components.len() - 1]
+                    .as_os_str()
+                    .to_string_lossy();
+                let display_path = format!("{}/{}", parent, filename);
+
+                // Check length, truncate if necessary
+                if display_path.len() > 50 {
+                    format!("...{}", &display_path[display_path.len() - 47..])
+                } else {
+                    display_path
+                }
+            } else {
+                file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            }
+        }
     }
 }

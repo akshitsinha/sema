@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::semantic::index::SemanticIndex;
+use crate::semantic::search::SemanticSearch;
 use crate::storage::{Database, service::ProcessingService};
 use crate::types::{
     AppState as AppStateEnum, ChunkConfig, CrawlerConfig, FocusedWindow, SearchResult, UIMode,
@@ -231,11 +231,8 @@ impl Engine {
         state_tx: mpsc::UnboundedSender<StateUpdate>,
         config_dir: PathBuf,
     ) {
-        // Generate embeddings phase
-        let _ = state_tx.send(StateUpdate::StateChanged(
-            AppStateEnum::GeneratingEmbeddings,
-        ));
-        let _ = state_tx.send(StateUpdate::EmbeddingStarted);
+        // First, set state to downloading model
+        let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::DownloadingModel));
 
         // Get total number of chunks from database
         let db_path = config_dir.join("db");
@@ -255,8 +252,8 @@ impl Engine {
             }
         };
 
-        // Initialize SemanticIndex with proper configurations
-        let mut semantic_index = match SemanticIndex::new(&config_dir, total_chunks) {
+        // Initialize SemanticSearch with proper configurations (this downloads the model)
+        let mut semantic_index = match SemanticSearch::new(&config_dir, total_chunks) {
             Ok(index) => index,
             Err(_) => {
                 let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
@@ -264,10 +261,16 @@ impl Engine {
             }
         };
 
+        // After model download, switch to generating embeddings
+        let _ = state_tx.send(StateUpdate::StateChanged(
+            AppStateEnum::GeneratingEmbeddings,
+        ));
+        let _ = state_tx.send(StateUpdate::EmbeddingStarted);
+
         let embedding_start_time = Instant::now();
 
         // Process all chunks and store embeddings in usearch index
-        if let Err(_) = semantic_index.process_all_chunks(&db) {
+        if let Err(_) = semantic_index.process_all_chunks(&db).await {
             let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
             return;
         }
@@ -315,7 +318,12 @@ impl Engine {
         }
 
         // Execute search using the processing service
-        if let Some(ref service) = self.processing_service {
+        if let Some(ref mut service) = self.processing_service {
+            // Initialize semantic search if not already done
+            if !service.has_semantic_search() {
+                let _ = service.init_semantic_search(); // Try to initialize, ignore errors
+            }
+
             match service.search(query, SEARCH_RESULTS_LIMIT).await {
                 Ok(results) => {
                     // Convert to SearchResult format
@@ -410,8 +418,8 @@ impl Engine {
     }
 
     pub fn calculate_search_result_line_offset(&self, search_result: &SearchResult) -> usize {
-        // Position the view to start exactly at the beginning of the chunk
-        // The chunk.start_line is 1-based, but scroll offset is 0-based
+        // Position at the start of the chunk
+        // chunk.start_line is 1-based, scroll offset is 0-based
         search_result.chunk.start_line.saturating_sub(1)
     }
 

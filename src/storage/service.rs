@@ -15,6 +15,7 @@ use tantivy::{
 use tokio::task;
 
 use super::Database;
+use crate::semantic::search::SemanticSearch;
 use crate::types::{Chunk, ChunkConfig, FileIndex};
 
 pub struct ProcessingService {
@@ -26,6 +27,8 @@ pub struct ProcessingService {
     path_field: Field,
     start_line_field: Field,
     end_line_field: Field,
+    semantic_search: Option<SemanticSearch>,
+    data_dir: PathBuf,
 }
 
 impl ProcessingService {
@@ -67,6 +70,8 @@ impl ProcessingService {
             path_field,
             start_line_field,
             end_line_field,
+            semantic_search: None, // Will be initialized later when embeddings are ready
+            data_dir: data_dir.to_path_buf(),
         })
     }
 
@@ -100,7 +105,11 @@ impl ProcessingService {
                                 .ok()?
                                 .as_secs();
 
-                            if current_modified <= file_index.last_modified {
+                            if current_modified > file_index.last_modified {
+                                // File has been modified, needs reindexing
+                                return None;
+                            } else {
+                                // File is up to date, skip reindexing
                                 return Some(path);
                             }
                         }
@@ -371,14 +380,23 @@ impl ProcessingService {
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<(Chunk, f32)>> {
-        // Only search if query starts with '
         let query = query.trim();
-        if !query.starts_with('\'') {
-            return Ok(Vec::new());
+
+        // Use text search for queries starting with '
+        if query.starts_with('\'') {
+            return self.text_search(&query[1..], limit).await;
         }
 
-        // Remove the ' prefix
-        let query = &query[1..];
+        // Use semantic search for regular queries
+        if let Some(ref semantic_search) = self.semantic_search {
+            return semantic_search_impl(semantic_search, query, limit, &self.db).await;
+        }
+
+        // Fallback to empty results if no semantic search available
+        Ok(Vec::new())
+    }
+
+    pub async fn text_search(&self, query: &str, limit: usize) -> Result<Vec<(Chunk, f32)>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -415,7 +433,6 @@ impl ProcessingService {
                         };
 
                         // Try to find the corresponding chunk in the database
-                        // This is a simplified approach - in production you'd want a more efficient lookup
                         let file_path = PathBuf::from(path_str);
                         if let Ok(content) = fs::read_to_string(&file_path) {
                             let mut hasher = Hasher::new();
@@ -424,7 +441,6 @@ impl ProcessingService {
 
                             // Try to find matching chunk
                             for chunk_id in 0..100 {
-                                // arbitrary limit
                                 let chunk_key = format!("chunk:{}:{}", file_hash, chunk_id);
                                 if let Ok(Some(chunk_data)) = self.db.get(chunk_key.as_bytes()) {
                                     if let Ok((chunk, _)) = bincode::decode_from_slice::<Chunk, _>(
@@ -449,8 +465,38 @@ impl ProcessingService {
         Ok(results)
     }
 
+    pub fn init_semantic_search(&mut self) -> Result<()> {
+        match SemanticSearch::new(&self.data_dir, 0) {
+            Ok(search) => {
+                self.semantic_search = Some(search);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn has_semantic_search(&self) -> bool {
+        self.semantic_search.is_some()
+    }
+
     pub async fn close(mut self) {
         // Commit any pending changes
         let _ = self.index_writer.commit();
+    }
+}
+
+async fn semantic_search_impl(
+    semantic_search: &SemanticSearch,
+    query: &str,
+    limit: usize,
+    db: &Database,
+) -> Result<Vec<(Chunk, f32)>> {
+    // Need to make search method mutable, so we create a mutable clone
+    // This is not ideal but needed for the current API
+    let db_path = semantic_search.get_db_path();
+    let config_dir = db_path.parent().unwrap();
+    match SemanticSearch::new(config_dir, 0) {
+        Ok(mut search) => search.search(query, limit, db).await,
+        Err(e) => Err(e),
     }
 }
