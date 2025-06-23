@@ -12,79 +12,48 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  ci:
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: sema-linux-x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: sema-windows-x86_64.exe
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: sema-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: sema-macos-aarch64
-
+          - os: ubuntu-latest
+            targets: "x86_64-unknown-linux-gnu x86_64-pc-windows-gnu"
+            deps: "sudo apt-get update && sudo apt-get install -y protobuf-compiler gcc-mingw-w64"
+          - os: macos-latest
+            targets: "x86_64-apple-darwin aarch64-apple-darwin"
+            deps: "brew install protobuf"
+      fail-fast: false
+    
     runs-on: ${{ matrix.os }}
     
     steps:
     - uses: actions/checkout@v4
     
-    - name: Install Rust toolchain
-      run: rustup target add ${{ matrix.target }}
+    - name: Install dependencies
+      run: ${{ matrix.deps }}
     
-    - name: Rust info
+    - name: Install Rust toolchain and targets
       run: |
-        rustc --version
-        cargo --version
+        for target in ${{ matrix.targets }}; do
+          rustup target add $target
+        done
     
-    - name: Install dependencies (Linux)
-      if: matrix.os == 'ubuntu-latest'
+    - name: Build/Check for all targets
       run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+        for target in ${{ matrix.targets }}; do
+          if [ "${{ github.event_name }}" = "release" ]; then
+            cargo build --release --target $target
+          else
+            cargo check --release --target $target
+          fi
+        done
     
-    - name: Install dependencies (macOS)
-      if: matrix.os == 'macos-latest'
-      run: brew install protobuf
-    
-    - name: Install dependencies (Windows)
-      if: matrix.os == 'windows-latest'
-      run: |
-        vcpkg install protobuf:x64-windows
-        echo "PROTOC=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf\protoc.exe" >> $env:GITHUB_ENV
-    
-    - name: Build
-      run: cargo build --release --target ${{ matrix.target }}
-    
-    - name: Get version
-      id: version
-      shell: bash
-      run: |
-        if [[ "${{ github.event_name }}" == "release" ]]; then
-          echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
-        else
-          echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Package binary
-      shell: bash
-      run: |
-        cd target/${{ matrix.target }}/release
-        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-          cp sema.exe ${{ matrix.name }}
-        else
-          cp sema ${{ matrix.name }}
-        fi
-    
-    - name: Upload artifacts
+    - name: Upload release artifacts
+      if: github.event_name == 'release'
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.name }}-${{ steps.version.outputs.version }}
-        path: target/${{ matrix.target }}/release/${{ matrix.name }}
-        retention-days: 30
+        name: sema-${{ matrix.os }}
+        path: |
+          target/*/release/sema
+          target/*/release/sema.exe
+        if-no-files-found: ignore

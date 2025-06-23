@@ -6,11 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::semantic::search::SemanticSearch;
-use crate::storage::{Database, service::ProcessingService};
-use crate::types::{
-    AppState as AppStateEnum, ChunkConfig, CrawlerConfig, FocusedWindow, SearchResult, UIMode,
-};
+use crate::storage::Processing;
+use crate::types::{AppState as AppStateEnum, CrawlerConfig, FocusedWindow, SearchResult, UIMode};
 
 const SEARCH_RESULTS_LIMIT: usize = 50;
 
@@ -71,7 +68,7 @@ pub struct Engine {
     pub timing_shown: bool,
 
     // Services
-    pub processing_service: Option<ProcessingService>,
+    pub processing_service: Option<Processing>,
 
     // Crawler management
     pub crawler_config: CrawlerConfig,
@@ -186,38 +183,36 @@ impl Engine {
     pub async fn start_chunking(
         state_tx: mpsc::UnboundedSender<StateUpdate>,
         files: Vec<PathBuf>,
-        max_file_size: u64,
+        _max_file_size: u64,
     ) {
         let processing_start_time = Instant::now();
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .join("sema");
 
-        let mut processing_service =
-            match ProcessingService::new(&config_dir, ChunkConfig::default()).await {
-                Ok(service) => service,
-                Err(_e) => {
-                    let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                    return;
-                }
-            };
+        let mut processing_service = match Processing::new(&config_dir).await {
+            Ok(service) => service,
+            Err(_e) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                return;
+            }
+        };
 
-        let should_start_embeddings =
-            match processing_service.process_files(files, max_file_size).await {
-                Ok(chunks_count) => {
-                    let processing_duration = processing_start_time.elapsed().as_secs_f64();
+        let should_start_embeddings = match processing_service.process_files(files).await {
+            Ok(chunks_count) => {
+                let processing_duration = processing_start_time.elapsed().as_secs_f64();
 
-                    let _ = state_tx.send(StateUpdate::ProcessingCompleted {
-                        chunks_count,
-                        duration_secs: processing_duration,
-                    });
-                    true
-                }
-                Err(_e) => {
-                    let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                    false
-                }
-            };
+                let _ = state_tx.send(StateUpdate::ProcessingCompleted {
+                    chunks_count,
+                    duration_secs: processing_duration,
+                });
+                true
+            }
+            Err(_e) => {
+                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+                false
+            }
+        };
 
         processing_service.close().await;
 
@@ -229,37 +224,22 @@ impl Engine {
 
     pub async fn start_embedding_generation(
         state_tx: mpsc::UnboundedSender<StateUpdate>,
-        config_dir: PathBuf,
+        _config_dir: PathBuf,
     ) {
         // First, set state to downloading model
         let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::DownloadingModel));
 
-        // Get total number of chunks from database
-        let db_path = config_dir.join("db");
-        let db = match Database::new(&db_path) {
-            Ok(db) => db,
-            Err(_) => {
-                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                return;
-            }
-        };
+        // TODO: Get total number of chunks from LanceDB instead
+        let _total_chunks = 0; // Placeholder until we implement chunk counting from LanceDB
 
-        let total_chunks = match Self::count_chunks_in_db(&db) {
-            Ok(count) => count,
-            Err(_) => {
-                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                return;
-            }
-        };
-
-        // Initialize SemanticSearch with proper configurations (this downloads the model)
-        let mut semantic_index = match SemanticSearch::new(&config_dir, total_chunks) {
-            Ok(index) => index,
-            Err(_) => {
-                let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                return;
-            }
-        };
+        // TODO: Enable when semantic search is fixed
+        // let mut semantic_index = match SemanticSearch::new(&config_dir, total_chunks) {
+        //     Ok(index) => index,
+        //     Err(_) => {
+        //         let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+        //         return;
+        //     }
+        // };
 
         // After model download, switch to generating embeddings
         let _ = state_tx.send(StateUpdate::StateChanged(
@@ -267,25 +247,26 @@ impl Engine {
         ));
         let _ = state_tx.send(StateUpdate::EmbeddingStarted);
 
-        let embedding_start_time = Instant::now();
+        // let embedding_start_time = Instant::now();
 
         // Process all chunks and store embeddings in usearch index
-        if let Err(_) = semantic_index.process_all_chunks(&db).await {
-            let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-            return;
-        }
+        // TODO: Fix semantic search processing
+        // if let Err(_) = semantic_index.process_all_chunks(chunks).await {
+        //     let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+        //     return;
+        // }
 
         // Save the index to disk
-        if semantic_index.save().is_err() {
-            let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-            return;
-        }
+        // if semantic_index.save().is_err() {
+        //     let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
+        //     return;
+        // }
 
-        let embedding_duration = embedding_start_time.elapsed().as_secs_f64();
-        let _ = state_tx.send(StateUpdate::EmbeddingCompleted {
-            chunks_count: total_chunks,
-            duration_secs: embedding_duration,
-        });
+        // let embedding_duration = embedding_start_time.elapsed().as_secs_f64();
+        // let _ = state_tx.send(StateUpdate::EmbeddingCompleted {
+        //     chunks_count: total_chunks,
+        //     duration_secs: embedding_duration,
+        // });
 
         let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
     }
@@ -306,7 +287,7 @@ impl Engine {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
                 .join("sema");
 
-            match ProcessingService::new(&config_dir, ChunkConfig::default()).await {
+            match Processing::new(&config_dir).await {
                 Ok(service) => {
                     self.processing_service = Some(service);
                 }
@@ -423,23 +404,8 @@ impl Engine {
         search_result.chunk.start_line.saturating_sub(1)
     }
 
-    fn count_chunks_in_db(db: &Database) -> Result<usize> {
-        let mut count = 0;
-        let iterator = db.iterator();
-
-        for item in iterator {
-            match item {
-                Ok((key, _)) => {
-                    if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-                        if key_str.starts_with("chunk:") && !key_str.contains("file_index:") {
-                            count += 1;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        Ok(count)
-    }
+    // TODO: Reimplement to count chunks from LanceDB
+    // fn count_chunks_in_db() -> Result<usize> {
+    //     Ok(0)
+    // }
 }

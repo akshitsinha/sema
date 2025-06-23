@@ -1,22 +1,14 @@
 use anyhow::Result;
-use arrow_array::{
-    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
 use hf_hub::api::sync::Api;
-use lancedb::{Table, connect};
 use ort::{inputs, session::Session, value::TensorRef};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-use crate::storage::Database;
 use crate::types::Chunk;
 
 pub struct VectorStore {
     session: Session,
     tokenizer: Tokenizer,
-    table: Option<Table>,
     db_path: PathBuf,
     // Pre-allocated buffers
     input_ids_array: ndarray::Array2<i64>,
@@ -50,7 +42,6 @@ impl VectorStore {
         Ok(Self {
             session,
             tokenizer,
-            table: None,
             db_path,
             input_ids_array,
             attention_mask_array,
@@ -59,70 +50,9 @@ impl VectorStore {
         })
     }
 
-    pub async fn process_all_chunks(&mut self, db: &Database) -> Result<()> {
-        let mut embeddings_batch = Vec::new();
-        let batch_size = 1000;
-
-        // Setup database
-        if self.db_path.exists() {
-            std::fs::remove_dir_all(&self.db_path)?;
-        }
-        let lancedb = connect(&self.db_path.to_string_lossy()).execute().await?;
-
-        let iterator = db.iterator();
-
-        for item in iterator {
-            match item {
-                Ok((key, value)) => {
-                    // Only process chunk keys, not file index keys
-                    if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-                        if key_str.starts_with("chunk:") && !key_str.contains("file_index:") {
-                            // Deserialize chunk from database
-                            if let Ok((chunk, _)) = bincode::decode_from_slice::<Chunk, _>(
-                                &value,
-                                bincode::config::standard(),
-                            ) {
-                                // Generate embedding for chunk content
-                                let embedding = self.generate_embedding(&chunk.content)?;
-                                embeddings_batch.push((
-                                    chunk.id.clone(),
-                                    chunk.content.clone(),
-                                    embedding,
-                                ));
-
-                                // Store batch when full
-                                if embeddings_batch.len() >= batch_size {
-                                    if self.table.is_none() {
-                                        self.table = Some(
-                                            create_vector_table(&lancedb, &embeddings_batch)
-                                                .await?,
-                                        );
-                                    } else {
-                                        add_embeddings_to_table(
-                                            self.table.as_ref().unwrap(),
-                                            &embeddings_batch,
-                                        )
-                                        .await?;
-                                    }
-                                    embeddings_batch.clear();
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Store remaining embeddings
-        if !embeddings_batch.is_empty() {
-            if self.table.is_none() {
-                self.table = Some(create_vector_table(&lancedb, &embeddings_batch).await?);
-            } else {
-                add_embeddings_to_table(self.table.as_ref().unwrap(), &embeddings_batch).await?;
-            }
-        }
-
+    // TODO: Reimplement to work with LanceDB directly instead of old Database
+    pub async fn process_all_chunks(&mut self, _chunks: Vec<Chunk>) -> Result<()> {
+        // Commented out until we can process chunks from LanceDB
         Ok(())
     }
 
@@ -229,102 +159,4 @@ fn download_tokenizer() -> Result<PathBuf> {
     let repo = api.model("sentence-transformers/all-MiniLM-L6-v2".to_string());
     let tokenizer_path = repo.get("tokenizer.json")?;
     Ok(tokenizer_path)
-}
-
-async fn create_vector_table(
-    db: &lancedb::Connection,
-    embeddings: &[(String, String, Vec<f32>)],
-) -> Result<Table> {
-    if embeddings.is_empty() {
-        return Err(anyhow::anyhow!("No embeddings to store"));
-    }
-
-    let embedding_dim = embeddings[0].2.len();
-
-    // Create schema for id + text + fixed-size vector embeddings
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                embedding_dim as i32,
-            ),
-            true,
-        ),
-    ]));
-
-    // Create data arrays
-    let batch = create_record_batch(&schema, embeddings)?;
-
-    // Create table with single batch
-    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-
-    let table = db
-        .create_table("embeddings", Box::new(batches))
-        .execute()
-        .await?;
-
-    Ok(table)
-}
-
-async fn add_embeddings_to_table(
-    table: &Table,
-    embeddings: &[(String, String, Vec<f32>)],
-) -> Result<()> {
-    if embeddings.is_empty() {
-        return Ok(());
-    }
-
-    let schema = table.schema().await?;
-    let batch = create_record_batch(&schema, embeddings)?;
-
-    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-
-    table.add(Box::new(batches)).execute().await?;
-    Ok(())
-}
-
-fn create_record_batch(
-    schema: &Schema,
-    embeddings: &[(String, String, Vec<f32>)],
-) -> Result<RecordBatch> {
-    let embedding_dim = embeddings[0].2.len();
-
-    // Create data arrays
-    let ids: Vec<&str> = embeddings.iter().map(|(id, _, _)| id.as_str()).collect();
-    let id_array = StringArray::from(ids);
-
-    let texts: Vec<&str> = embeddings
-        .iter()
-        .map(|(_, text, _)| text.as_str())
-        .collect();
-    let text_array = StringArray::from(texts);
-
-    // Create fixed-size list array for embeddings
-    let flat_embeddings: Vec<f32> = embeddings
-        .iter()
-        .flat_map(|(_, _, embedding)| embedding.iter().cloned())
-        .collect();
-
-    let values = Float32Array::from(flat_embeddings);
-    let vector_array = FixedSizeListArray::new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
-        embedding_dim as i32,
-        Arc::new(values),
-        None,
-    );
-
-    // Create record batch
-    let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
-        vec![
-            Arc::new(id_array),
-            Arc::new(text_array),
-            Arc::new(vector_array),
-        ],
-    )?;
-
-    Ok(batch)
 }
