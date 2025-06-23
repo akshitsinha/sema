@@ -1,10 +1,10 @@
 use crate::types::{SearchResult, UIMode};
 use crossterm::event::{KeyCode, KeyEvent};
+use tui_input::{Input, backend::crossterm::EventHandler as InputEventHandler};
 
 pub enum EventResult {
     ExecuteSearch(String),
-    OpenFile(String), // File path to open
-    ClearFileCache,   // Clear cached file content
+    OpenFile, // Open the current selected file
     Continue,
     Quit,
 }
@@ -14,7 +14,7 @@ pub struct EventHandler;
 impl EventHandler {
     pub async fn handle_key_input(
         key: &KeyEvent,
-        search_input: &mut String,
+        search_input: &mut Input,
         ui_mode: &mut UIMode,
         selected_search_result: &mut usize,
         search_results_scroll_offset: &mut usize,
@@ -29,15 +29,15 @@ impl EventHandler {
             KeyCode::Char('q') => EventResult::Quit,
             KeyCode::Enter => match *ui_mode {
                 UIMode::SearchInput => {
-                    if !search_input.trim().is_empty() {
-                        EventResult::ExecuteSearch(search_input.clone())
+                    if !search_input.value().trim().is_empty() {
+                        EventResult::ExecuteSearch(search_input.value().to_string())
                     } else {
                         EventResult::Continue
                     }
                 }
                 UIMode::SearchResults | UIMode::FilePreview => {
-                    if let Some(result) = current_search_result {
-                        EventResult::OpenFile(result.chunk.file_path.to_string_lossy().to_string())
+                    if current_search_result.is_some() {
+                        EventResult::OpenFile
                     } else {
                         EventResult::Continue
                     }
@@ -47,15 +47,15 @@ impl EventHandler {
                 match *ui_mode {
                     UIMode::FilePreview => {
                         *ui_mode = UIMode::SearchResults;
-                        EventResult::ClearFileCache
+                        EventResult::Continue
                     }
                     UIMode::SearchResults => {
                         *ui_mode = UIMode::SearchInput;
-                        EventResult::ClearFileCache
+                        EventResult::Continue
                     }
                     UIMode::SearchInput => {
                         // Clear search input and results
-                        search_input.clear();
+                        search_input.reset();
                         EventResult::ExecuteSearch(String::new())
                     }
                 }
@@ -148,15 +148,29 @@ impl EventHandler {
                 }
                 EventResult::Continue
             }
-            KeyCode::Backspace => {
-                if matches!(*ui_mode, UIMode::SearchInput) && !search_input.is_empty() {
-                    search_input.pop();
+            KeyCode::Backspace | KeyCode::Delete => {
+                if matches!(*ui_mode, UIMode::SearchInput) {
+                    search_input.handle_event(&crossterm::event::Event::Key(*key));
+                }
+                EventResult::Continue
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                if matches!(*ui_mode, UIMode::SearchInput) {
+                    search_input.handle_event(&crossterm::event::Event::Key(*key));
                 }
                 EventResult::Continue
             }
             KeyCode::Char(c) => {
                 if matches!(*ui_mode, UIMode::SearchInput) {
-                    search_input.push(c);
+                    // Handle Ctrl+A, Ctrl+W, etc.
+                    search_input.handle_event(&crossterm::event::Event::Key(*key));
+                } else if c == 'c'
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    // Ctrl+C to quit
+                    return EventResult::Quit;
                 }
                 EventResult::Continue
             }
@@ -164,17 +178,26 @@ impl EventHandler {
         }
     }
 
-    pub fn handle_non_ready_input(key: &KeyEvent, search_input: &mut String) -> EventResult {
+    pub fn handle_non_ready_input(key: &KeyEvent, search_input: &mut Input) -> EventResult {
         match key.code {
             KeyCode::Char('q') => EventResult::Quit,
-            KeyCode::Backspace => {
-                if !search_input.is_empty() {
-                    search_input.pop();
-                }
+            KeyCode::Char('c')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                EventResult::Quit
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                search_input.handle_event(&crossterm::event::Event::Key(*key));
                 EventResult::Continue
             }
-            KeyCode::Char(c) => {
-                search_input.push(c);
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                search_input.handle_event(&crossterm::event::Event::Key(*key));
+                EventResult::Continue
+            }
+            KeyCode::Char(_) => {
+                search_input.handle_event(&crossterm::event::Event::Key(*key));
                 EventResult::Continue
             }
             _ => EventResult::Continue,

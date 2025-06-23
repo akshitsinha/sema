@@ -11,17 +11,19 @@ use tantivy::{
 
 use crate::types::Chunk;
 
-/// Tantivy indexer for full-text search of chunks
 pub struct TextIndexer {
     index: Index,
     index_writer: IndexWriter,
     index_reader: IndexReader,
-    content_field: Field,
-    path_field: Field,
-    start_line_field: Field,
-    end_line_field: Field,
-    id_field: Field,
-    hash_field: Field,
+    schema_fields: SchemaFields,
+}
+
+struct SchemaFields {
+    content: Field,
+    path: Field,
+    start_line: Field,
+    end_line: Field,
+    id: Field,
 }
 
 impl TextIndexer {
@@ -29,19 +31,8 @@ impl TextIndexer {
         let index_path = data_dir.join("index");
         std::fs::create_dir_all(&index_path)?;
 
-        // Initialize Tantivy schema
-        let mut schema_builder = Schema::builder();
-        let content_field = schema_builder.add_text_field("content", TEXT | STORED);
-        let path_field = schema_builder.add_text_field("path", TEXT | STORED);
-        let start_line_field = schema_builder.add_u64_field("start_line", STORED);
-        let end_line_field = schema_builder.add_u64_field("end_line", STORED);
-        let id_field = schema_builder.add_text_field("id", STORED);
-        let hash_field = schema_builder.add_text_field("hash", STORED);
-        let schema = schema_builder.build();
-
-        // Initialize Tantivy index
-        let index_dir = MmapDirectory::open(&index_path)?;
-        let index = Index::open_or_create(index_dir, schema.clone())?;
+        let (schema, fields) = Self::create_schema();
+        let index = Self::create_or_open_index(&index_path, schema)?;
 
         let index_writer = index.writer(200_000_000)?; // 200MB heap
         let index_reader = index
@@ -53,13 +44,27 @@ impl TextIndexer {
             index,
             index_writer,
             index_reader,
-            content_field,
-            path_field,
-            start_line_field,
-            end_line_field,
-            id_field,
-            hash_field,
+            schema_fields: fields,
         })
+    }
+
+    fn create_schema() -> (Schema, SchemaFields) {
+        let mut schema_builder = Schema::builder();
+
+        let fields = SchemaFields {
+            content: schema_builder.add_text_field("content", TEXT | STORED),
+            path: schema_builder.add_text_field("path", TEXT | STORED),
+            start_line: schema_builder.add_u64_field("start_line", STORED),
+            end_line: schema_builder.add_u64_field("end_line", STORED),
+            id: schema_builder.add_text_field("id", STORED),
+        };
+
+        (schema_builder.build(), fields)
+    }
+
+    fn create_or_open_index(index_path: &Path, schema: Schema) -> Result<Index> {
+        let index_dir = MmapDirectory::open(index_path)?;
+        Ok(Index::open_or_create(index_dir, schema)?)
     }
 
     pub fn index_chunks(&mut self, chunks: &[Chunk]) -> Result<()> {
@@ -67,25 +72,28 @@ impl TextIndexer {
             return Ok(());
         }
 
-        // Add documents to index in bulk
         for chunk in chunks {
-            let doc = doc!(
-                self.content_field => chunk.content.clone(),
-                self.path_field => chunk.file_path.to_string_lossy().to_string(),
-                self.start_line_field => chunk.start_line as u64,
-                self.end_line_field => chunk.end_line as u64,
-                self.id_field => chunk.id.clone(),
-                self.hash_field => chunk.hash.clone(),
-            );
+            let doc = self.create_document(chunk);
             self.index_writer.add_document(doc)?;
         }
 
-        // Commit changes
+        self.commit_and_reload()?;
+        Ok(())
+    }
+
+    fn create_document(&self, chunk: &Chunk) -> TantivyDocument {
+        doc!(
+            self.schema_fields.content => chunk.content.clone(),
+            self.schema_fields.path => chunk.file_path.to_string_lossy().to_string(),
+            self.schema_fields.start_line => chunk.start_line as u64,
+            self.schema_fields.end_line => chunk.end_line as u64,
+            self.schema_fields.id => chunk.id.clone(),
+        )
+    }
+
+    fn commit_and_reload(&mut self) -> Result<()> {
         self.index_writer.commit()?;
-
-        // Reload the reader to see new documents
         self.index_reader.reload()?;
-
         Ok(())
     }
 
@@ -95,70 +103,71 @@ impl TextIndexer {
         }
 
         let searcher = self.index_reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![self.schema_fields.content]);
 
-        let query = query_parser.parse_query(query)?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let parsed_query = query_parser.parse_query(query)?;
+        let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
 
         let mut results = Vec::new();
 
         for (score, doc_address) in top_docs {
-            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-
-            if let (
-                Some(id_value),
-                Some(path_value),
-                Some(start_line_value),
-                Some(end_line_value),
-                Some(content_value),
-                Some(hash_value),
-            ) = (
-                retrieved_doc.get_first(self.id_field),
-                retrieved_doc.get_first(self.path_field),
-                retrieved_doc.get_first(self.start_line_field),
-                retrieved_doc.get_first(self.end_line_field),
-                retrieved_doc.get_first(self.content_field),
-                retrieved_doc.get_first(self.hash_field),
-            ) {
-                let id = match OwnedValue::from(id_value) {
-                    OwnedValue::Str(s) => s,
-                    _ => continue,
-                };
-                let path_str = match OwnedValue::from(path_value) {
-                    OwnedValue::Str(s) => s,
-                    _ => continue,
-                };
-                let start_line = match OwnedValue::from(start_line_value) {
-                    OwnedValue::U64(n) => n as usize,
-                    _ => continue,
-                };
-                let end_line = match OwnedValue::from(end_line_value) {
-                    OwnedValue::U64(n) => n as usize,
-                    _ => continue,
-                };
-                let content = match OwnedValue::from(content_value) {
-                    OwnedValue::Str(s) => s,
-                    _ => continue,
-                };
-                let hash = match OwnedValue::from(hash_value) {
-                    OwnedValue::Str(s) => s,
-                    _ => continue,
-                };
-
-                let chunk = Chunk {
-                    id,
-                    file_path: std::path::PathBuf::from(path_str),
-                    start_line,
-                    end_line,
-                    content,
-                    hash,
-                };
-
+            if let Some(chunk) = self.extract_chunk_from_document(&searcher, doc_address)? {
                 results.push((chunk, score));
             }
         }
 
         Ok(results)
+    }
+
+    fn extract_chunk_from_document(
+        &self,
+        searcher: &tantivy::Searcher,
+        doc_address: tantivy::DocAddress,
+    ) -> Result<Option<Chunk>> {
+        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+
+        let id = self.extract_string_field(&retrieved_doc, self.schema_fields.id)?;
+        let path_str = self.extract_string_field(&retrieved_doc, self.schema_fields.path)?;
+        let content = self.extract_string_field(&retrieved_doc, self.schema_fields.content)?;
+
+        let start_line =
+            self.extract_u64_field(&retrieved_doc, self.schema_fields.start_line)? as usize;
+        let end_line =
+            self.extract_u64_field(&retrieved_doc, self.schema_fields.end_line)? as usize;
+
+        if let (Some(id), Some(path_str), Some(content)) = (id, path_str, content) {
+            Ok(Some(Chunk {
+                id,
+                file_path: std::path::PathBuf::from(path_str),
+                start_line,
+                end_line,
+                content,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn extract_string_field(&self, doc: &TantivyDocument, field: Field) -> Result<Option<String>> {
+        if let Some(value) = doc.get_first(field) {
+            match OwnedValue::from(value) {
+                OwnedValue::Str(s) => Ok(Some(s)),
+                _ => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn extract_u64_field(&self, doc: &TantivyDocument, field: Field) -> Result<u64> {
+        if let Some(value) = doc.get_first(field) {
+            match OwnedValue::from(value) {
+                OwnedValue::U64(n) => Ok(n),
+                _ => Ok(0),
+            }
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn commit(&mut self) -> Result<()> {

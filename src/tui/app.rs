@@ -129,9 +129,8 @@ impl App {
                 }
                 StateUpdate::AllFilesCollected(files) => {
                     let state_tx = self.state_tx.clone();
-                    let max_file_size = self.engine.crawler_config.max_file_size;
                     tokio::spawn(async move {
-                        Engine::start_chunking(state_tx, files, max_file_size).await;
+                        Engine::start_chunking(state_tx, files).await;
                     });
                 }
                 StateUpdate::CrawlingCompleted {
@@ -147,20 +146,6 @@ impl App {
                 } => {
                     self.engine.processing_stats = Some((chunks_count, duration_secs));
                     self.engine.data_changed = true;
-                    // Don't set to Ready yet - embedding generation will start
-                }
-                StateUpdate::EmbeddingStarted => {
-                    self.engine.data_changed = true;
-                }
-                StateUpdate::EmbeddingCompleted {
-                    chunks_count,
-                    duration_secs,
-                } => {
-                    self.engine.embedding_stats = Some((chunks_count, duration_secs));
-                    self.engine.data_changed = true;
-                    self.engine.app_state.state = crate::types::AppState::Ready;
-                    self.engine.ui_mode = crate::types::UIMode::SearchInput;
-                    self.engine.update_focused_window();
                 }
             }
         }
@@ -169,10 +154,11 @@ impl App {
     async fn handle_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                // Clear search error on any key press
                 if self.engine.search_error.is_some() {
                     self.engine.search_error = None;
                 }
+
+                let prev_selected = self.engine.selected_search_result;
 
                 let result = match self.engine.app_state.state {
                     crate::types::AppState::Ready => {
@@ -203,15 +189,8 @@ impl App {
                     EventResult::ExecuteSearch(query) => {
                         self.execute_search(&query).await;
                     }
-                    EventResult::OpenFile(file_path) => {
-                        self.open_file(&file_path).await;
-                    }
-                    EventResult::ClearFileCache => {
-                        self.engine.clear_file_cache();
-                        // Reset scroll offset when going back to chunk view
-                        if matches!(self.engine.ui_mode, crate::types::UIMode::SearchResults) {
-                            self.engine.file_preview_scroll_offset = 0;
-                        }
+                    EventResult::OpenFile => {
+                        self.open_file().await;
                     }
                     EventResult::Quit => {
                         self.engine.should_quit = true;
@@ -219,8 +198,10 @@ impl App {
                     EventResult::Continue => {}
                 }
 
-                // Auto-load file if we're in file preview mode and selection changed
-                self.auto_load_file_preview().await;
+                // Only sync file preview if selection changed
+                if self.engine.selected_search_result != prev_selected {
+                    self.sync_file_preview().await;
+                }
 
                 self.engine.update_focused_window();
                 true
@@ -241,9 +222,6 @@ impl App {
     }
 
     async fn execute_search(&mut self, query: &str) {
-        // Clear file cache when starting a new search
-        self.engine.clear_file_cache();
-
         if query.trim().is_empty() || query.trim().len() <= 2 {
             self.engine.clear_search();
             return;
@@ -252,75 +230,84 @@ impl App {
         if self.engine.execute_search(query).await.is_err() {
             self.engine.search_error = Some("Search failed".to_string());
             self.engine.clear_search();
+            return;
+        }
+
+        // Load first result for preview
+        if !self.engine.search_results.is_empty() {
+            let first_result = self.engine.search_results[0].clone();
+            let file_path = &first_result.chunk.file_path;
+
+            self.engine.update_current_file_content(file_path).await;
+
+            let scroll_offset = self
+                .engine
+                .calculate_search_result_line_offset(&first_result);
+            self.engine.file_preview_scroll_offset = scroll_offset;
         }
     }
 
-    async fn open_file(&mut self, _file_path: &str) {
-        // Get the current search result to determine file and scroll position
-        let (file_path, scroll_offset) = if let Some(selected_result) = self
+    async fn open_file(&mut self) {
+        let selected_result = if let Some(result) = self
             .engine
             .search_results
             .get(self.engine.selected_search_result)
         {
-            let file_path = selected_result.chunk.file_path.clone();
-            let scroll_offset = self
-                .engine
-                .calculate_search_result_line_offset(selected_result);
-            (Some(file_path), scroll_offset)
+            result.clone()
         } else {
-            (None, 0)
+            self.engine.ui_mode = crate::types::UIMode::FilePreview;
+            self.engine.update_focused_window();
+            return;
         };
 
-        // Load the full file content if we have a file path
-        if let Some(file_path) = file_path {
-            if self.engine.load_file_content(&file_path).await.is_ok() {
-                self.engine.file_preview_scroll_offset = scroll_offset;
-            }
-        }
+        let file_path = &selected_result.chunk.file_path;
 
-        // Switch to file preview mode
+        self.engine.update_current_file_content(file_path).await;
+
+        let scroll_offset = self
+            .engine
+            .calculate_search_result_line_offset(&selected_result);
+
+        self.engine.file_preview_scroll_offset = scroll_offset;
         self.engine.ui_mode = crate::types::UIMode::FilePreview;
         self.engine.update_focused_window();
     }
 
-    async fn auto_load_file_preview(&mut self) {
-        // Only auto-load if we're in file preview mode and navigating between results
-        if matches!(self.engine.ui_mode, crate::types::UIMode::FilePreview) {
-            if let Some(selected_result) = self
-                .engine
-                .search_results
-                .get(self.engine.selected_search_result)
-            {
-                let file_path = &selected_result.chunk.file_path;
+    async fn sync_file_preview(&mut self) {
+        let selected_result = if let Some(result) = self
+            .engine
+            .search_results
+            .get(self.engine.selected_search_result)
+        {
+            result.clone()
+        } else {
+            return;
+        };
 
-                // Check if we need to load a different file
-                let needs_new_file = match &self.engine.cached_file_path {
-                    Some(cached_path) => cached_path != file_path,
-                    None => true,
-                };
+        let file_path = &selected_result.chunk.file_path;
 
-                if needs_new_file {
-                    // Load the new file content and position at the search result
-                    let file_path = file_path.clone();
-                    let scroll_offset = self
-                        .engine
-                        .calculate_search_result_line_offset(selected_result);
+        // Check if we need to load a different file
+        let needs_new_file = if let Some(current_path) = &self.engine.current_file_path {
+            current_path != file_path
+        } else {
+            true
+        };
 
-                    if self.engine.load_file_content(&file_path).await.is_ok() {
-                        self.engine.file_preview_scroll_offset = scroll_offset;
-                    }
-                }
-            }
+        if needs_new_file {
+            self.engine.update_current_file_content(file_path).await;
         }
+
+        // Always set the scroll offset to the chunk position
+        let scroll_offset = self
+            .engine
+            .calculate_search_result_line_offset(&selected_result);
+        self.engine.file_preview_scroll_offset = scroll_offset;
     }
 
     fn should_update_spinner(&self) -> bool {
         matches!(
             self.engine.app_state.state,
-            crate::types::AppState::Crawling
-                | crate::types::AppState::Chunking
-                | crate::types::AppState::DownloadingModel
-                | crate::types::AppState::GeneratingEmbeddings
+            crate::types::AppState::Crawling | crate::types::AppState::Chunking
         )
     }
 }

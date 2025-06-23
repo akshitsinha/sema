@@ -1,15 +1,12 @@
 use anyhow::Result;
 use hf_hub::api::sync::Api;
 use ort::{inputs, session::Session, value::TensorRef};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
-
-use crate::types::Chunk;
 
 pub struct VectorStore {
     session: Session,
     tokenizer: Tokenizer,
-    db_path: PathBuf,
     // Pre-allocated buffers
     input_ids_array: ndarray::Array2<i64>,
     attention_mask_array: ndarray::Array2<i64>,
@@ -18,9 +15,7 @@ pub struct VectorStore {
 }
 
 impl VectorStore {
-    pub fn new(config_dir: &Path, _total_chunks: usize) -> Result<Self> {
-        let db_path = config_dir.join("embeddings_lancedb");
-
+    pub fn new() -> Result<Self> {
         // Download model and tokenizer
         let model_path = download_model()?;
         let tokenizer_path = download_tokenizer()?;
@@ -42,27 +37,11 @@ impl VectorStore {
         Ok(Self {
             session,
             tokenizer,
-            db_path,
             input_ids_array,
             attention_mask_array,
             token_type_ids_array,
             attention_mask_f32,
         })
-    }
-
-    // TODO: Reimplement to work with LanceDB directly instead of old Database
-    pub async fn process_all_chunks(&mut self, _chunks: Vec<Chunk>) -> Result<()> {
-        // Commented out until we can process chunks from LanceDB
-        Ok(())
-    }
-
-    pub fn save(&self) -> Result<()> {
-        // LanceDB automatically persists data, no explicit save needed
-        Ok(())
-    }
-
-    pub fn get_db_path(&self) -> &PathBuf {
-        &self.db_path
     }
 
     pub fn generate_embedding(&mut self, text: &str) -> Result<Vec<f32>> {

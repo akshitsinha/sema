@@ -49,10 +49,7 @@ impl From<&crate::config::GeneralConfig> for CrawlerConfig {
 pub enum AppState {
     Crawling,
     Chunking,
-    DownloadingModel,
-    GeneratingEmbeddings,
     Ready,
-    Searching,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,7 +90,6 @@ pub struct Chunk {
     pub start_line: usize,
     pub end_line: usize,
     pub content: String,
-    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

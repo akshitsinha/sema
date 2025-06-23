@@ -6,29 +6,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub general: GeneralConfig,
-    pub tui: TuiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
-    /// Maximum file size to process (in bytes)
     pub max_file_size: u64,
-    /// File extensions to include in crawling
     pub file_extensions: Vec<String>,
-    /// Patterns to exclude from crawling
     pub exclude_patterns: Vec<String>,
-    /// Whether to follow symbolic links
     pub follow_symlinks: bool,
-    /// Whether to include hidden files
     pub include_hidden: bool,
-    /// Whether to ignore files listed in .gitignore files
     pub ignore_gitignore: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TuiConfig {
-    pub refresh_rate: u64,
-    pub theme: String,
 }
 
 pub struct ConfigManager {
@@ -39,9 +26,8 @@ pub struct ConfigManager {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            max_file_size: 10_485_760, // 10MB
+            max_file_size: 10_485_760,
             file_extensions: vec![
-                // Programming languages
                 "rs".to_string(),
                 "py".to_string(),
                 "js".to_string(),
@@ -130,15 +116,6 @@ impl Default for GeneralConfig {
             follow_symlinks: false,
             include_hidden: false,
             ignore_gitignore: true,
-        }
-    }
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            refresh_rate: 60,
-            theme: "light".to_string(),
         }
     }
 }

@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tui_input::Input;
 
 use crate::config::Config;
 use crate::crawler::FileCrawler;
-use crate::storage::Processing;
+use crate::storage::StorageManager;
 use crate::types::{AppState as AppStateEnum, CrawlerConfig, FocusedWindow, SearchResult, UIMode};
 
 const SEARCH_RESULTS_LIMIT: usize = 50;
@@ -30,26 +31,18 @@ pub enum StateUpdate {
         chunks_count: usize,
         duration_secs: f64,
     },
-    EmbeddingStarted,
-    EmbeddingCompleted {
-        chunks_count: usize,
-        duration_secs: f64,
-    },
 }
 
 pub struct Engine {
-    // Core state
     pub should_quit: bool,
     pub app_state: AppStateData,
     pub data_changed: bool,
 
-    // UI state
     pub ui_mode: UIMode,
     pub focused_window: FocusedWindow,
     pub spinner_frame: usize,
 
-    // Search state
-    pub search_input: String,
+    pub search_input: Input,
     pub search_results: Vec<SearchResult>,
     pub selected_search_result: usize,
     pub search_results_scroll_offset: usize,
@@ -57,20 +50,15 @@ pub struct Engine {
     pub current_search_query: String,
     pub search_error: Option<String>,
 
-    // File preview state
-    pub cached_file_content: Option<String>,
-    pub cached_file_path: Option<PathBuf>,
+    pub current_file_content: Option<String>,
+    pub current_file_path: Option<PathBuf>,
 
-    // Stats
     pub crawling_stats: Option<(usize, f64)>,
     pub processing_stats: Option<(usize, f64)>,
-    pub embedding_stats: Option<(usize, f64)>,
     pub timing_shown: bool,
 
-    // Services
-    pub processing_service: Option<Processing>,
+    pub processing_service: Option<StorageManager>,
 
-    // Crawler management
     pub crawler_config: CrawlerConfig,
     pub root_path: PathBuf,
 }
@@ -91,7 +79,7 @@ impl Engine {
             focused_window: FocusedWindow::SearchInput,
             spinner_frame: 0,
 
-            search_input: String::new(),
+            search_input: Input::default(),
             search_results: Vec::new(),
             selected_search_result: 0,
             search_results_scroll_offset: 0,
@@ -99,12 +87,11 @@ impl Engine {
             current_search_query: String::new(),
             search_error: None,
 
-            cached_file_content: None,
-            cached_file_path: None,
+            current_file_content: None,
+            current_file_path: None,
 
             crawling_stats: None,
             processing_stats: None,
-            embedding_stats: None,
             timing_shown: false,
             processing_service: None,
 
@@ -127,13 +114,10 @@ impl Engine {
         self.search_results_scroll_offset = 0;
         self.current_search_query.clear();
         self.search_error = None;
+        self.current_file_content = None;
+        self.current_file_path = None;
         self.ui_mode = UIMode::SearchInput;
         self.update_focused_window();
-    }
-
-    pub fn clear_file_cache(&mut self) {
-        self.cached_file_content = None;
-        self.cached_file_path = None;
     }
 
     // Crawler management
@@ -180,25 +164,21 @@ impl Engine {
         Ok(crawler_handle)
     }
 
-    pub async fn start_chunking(
-        state_tx: mpsc::UnboundedSender<StateUpdate>,
-        files: Vec<PathBuf>,
-        _max_file_size: u64,
-    ) {
+    pub async fn start_chunking(state_tx: mpsc::UnboundedSender<StateUpdate>, files: Vec<PathBuf>) {
         let processing_start_time = Instant::now();
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .join("sema");
 
-        let mut processing_service = match Processing::new(&config_dir).await {
+        let mut processing_service = match StorageManager::new(&config_dir).await {
             Ok(service) => service,
-            Err(_e) => {
+            Err(_) => {
                 let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
                 return;
             }
         };
 
-        let should_start_embeddings = match processing_service.process_files(files).await {
+        match processing_service.process_and_index_files(files).await {
             Ok(chunks_count) => {
                 let processing_duration = processing_start_time.elapsed().as_secs_f64();
 
@@ -206,68 +186,15 @@ impl Engine {
                     chunks_count,
                     duration_secs: processing_duration,
                 });
-                true
             }
-            Err(_e) => {
+            Err(_) => {
                 let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-                false
+                processing_service.close().await;
+                return;
             }
-        };
+        }
 
         processing_service.close().await;
-
-        // Start embedding generation after processing service is closed
-        if should_start_embeddings {
-            Self::start_embedding_generation(state_tx.clone(), config_dir.clone()).await;
-        }
-    }
-
-    pub async fn start_embedding_generation(
-        state_tx: mpsc::UnboundedSender<StateUpdate>,
-        _config_dir: PathBuf,
-    ) {
-        // First, set state to downloading model
-        let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::DownloadingModel));
-
-        // TODO: Get total number of chunks from LanceDB instead
-        let _total_chunks = 0; // Placeholder until we implement chunk counting from LanceDB
-
-        // TODO: Enable when semantic search is fixed
-        // let mut semantic_index = match SemanticSearch::new(&config_dir, total_chunks) {
-        //     Ok(index) => index,
-        //     Err(_) => {
-        //         let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-        //         return;
-        //     }
-        // };
-
-        // After model download, switch to generating embeddings
-        let _ = state_tx.send(StateUpdate::StateChanged(
-            AppStateEnum::GeneratingEmbeddings,
-        ));
-        let _ = state_tx.send(StateUpdate::EmbeddingStarted);
-
-        // let embedding_start_time = Instant::now();
-
-        // Process all chunks and store embeddings in usearch index
-        // TODO: Fix semantic search processing
-        // if let Err(_) = semantic_index.process_all_chunks(chunks).await {
-        //     let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-        //     return;
-        // }
-
-        // Save the index to disk
-        // if semantic_index.save().is_err() {
-        //     let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
-        //     return;
-        // }
-
-        // let embedding_duration = embedding_start_time.elapsed().as_secs_f64();
-        // let _ = state_tx.send(StateUpdate::EmbeddingCompleted {
-        //     chunks_count: total_chunks,
-        //     duration_secs: embedding_duration,
-        // });
-
         let _ = state_tx.send(StateUpdate::StateChanged(AppStateEnum::Ready));
     }
 
@@ -276,10 +203,8 @@ impl Engine {
         self.search_error = None;
         self.current_search_query = query.to_string();
 
-        // Clear timing stats once a search is performed
         self.crawling_stats = None;
         self.processing_stats = None;
-        self.embedding_stats = None;
 
         // Initialize processing service if needed
         if self.processing_service.is_none() {
@@ -287,7 +212,7 @@ impl Engine {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
                 .join("sema");
 
-            match Processing::new(&config_dir).await {
+            match StorageManager::new(&config_dir).await {
                 Ok(service) => {
                     self.processing_service = Some(service);
                 }
@@ -300,11 +225,6 @@ impl Engine {
 
         // Execute search using the processing service
         if let Some(ref mut service) = self.processing_service {
-            // Initialize semantic search if not already done
-            if !service.has_semantic_search() {
-                let _ = service.init_semantic_search(); // Try to initialize, ignore errors
-            }
-
             match service.search(query, SEARCH_RESULTS_LIMIT).await {
                 Ok(results) => {
                     // Convert to SearchResult format
@@ -350,21 +270,17 @@ impl Engine {
             file_groups.entry(file_path).or_default().push(result);
         }
 
-        // For each file, keep the best result and set the total count
+        // For each file, keep the first occurrence and set the total count
         let mut grouped_results: Vec<SearchResult> = file_groups
             .into_values()
             .map(|mut group| {
-                // Sort by score and take the best one
-                group.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                // Sort by start_line to get the first occurrence in the file
+                group.sort_by(|a, b| a.chunk.start_line.cmp(&b.chunk.start_line));
 
                 let total_count = group.len();
-                let mut best_result = group.into_iter().next().unwrap();
-                best_result.total_matches_in_file = total_count;
-                best_result
+                let mut first_result = group.into_iter().next().unwrap();
+                first_result.total_matches_in_file = total_count;
+                first_result
             })
             .collect();
 
@@ -379,23 +295,98 @@ impl Engine {
     }
 
     // File content management
-    pub async fn load_file_content(&mut self, file_path: &std::path::Path) -> Result<&str> {
-        // Check if we already have this file cached
-        if let Some(ref cached_path) = self.cached_file_path {
-            if cached_path == file_path && self.cached_file_content.is_some() {
-                return Ok(self.cached_file_content.as_ref().unwrap());
+    pub async fn load_file_content(&self, file_path: &std::path::Path) -> Result<String> {
+        // Check file size first
+        match tokio::fs::metadata(file_path).await {
+            Ok(metadata) => {
+                const MAX_PREVIEW_SIZE: u64 = 1_048_576; // 1MB
+                if metadata.len() > MAX_PREVIEW_SIZE {
+                    let size_mb = metadata.len() as f64 / 1_048_576.0;
+                    return Ok(format!(
+                        "File size too large to display ({:.1} MB)",
+                        size_mb
+                    ));
+                }
+            }
+            Err(e) => {
+                return Ok(format!("Failed to read file metadata: {}", e));
             }
         }
 
         // Read the file content
         match tokio::fs::read_to_string(file_path).await {
-            Ok(content) => {
-                self.cached_file_content = Some(content);
-                self.cached_file_path = Some(file_path.to_path_buf());
-                Ok(self.cached_file_content.as_ref().unwrap())
-            }
-            Err(e) => Err(anyhow::anyhow!("Failed to read file: {}", e)),
+            Ok(content) => Ok(content),
+            Err(e) => Ok(format!("Failed to read file: {}", e)),
         }
+    }
+
+    pub async fn update_current_file_content(&mut self, file_path: &std::path::Path) {
+        match self.load_file_content(file_path).await {
+            Ok(content) => {
+                self.current_file_content = Some(content);
+                self.current_file_path = Some(file_path.to_path_buf());
+            }
+            Err(_) => {
+                self.current_file_content = Some("Failed to load file".to_string());
+                self.current_file_path = Some(file_path.to_path_buf());
+            }
+        }
+    }
+
+    // Lazy loading - only load visible portion for large files
+    pub async fn load_file_window(
+        &self,
+        file_path: &std::path::Path,
+        start_line: usize,
+        window_size: usize,
+    ) -> Result<String> {
+        // Check file size first
+        let metadata = tokio::fs::metadata(file_path).await?;
+        const LAZY_THRESHOLD: u64 = 262_144; // 256KB - use lazy loading for files larger than this
+        const MAX_PREVIEW_SIZE: u64 = 1_048_576; // 1MB
+
+        if metadata.len() > MAX_PREVIEW_SIZE {
+            let size_mb = metadata.len() as f64 / 1_048_576.0;
+            return Ok(format!(
+                "File size too large to display ({:.1} MB)",
+                size_mb
+            ));
+        }
+
+        // For smaller files, use regular loading
+        if metadata.len() <= LAZY_THRESHOLD {
+            return self.load_file_content(file_path).await;
+        }
+
+        // For larger files, read only visible window
+        use std::io::{BufRead, BufReader};
+        use tokio::fs::File;
+
+        let file = File::open(file_path).await?;
+        let mut reader = BufReader::new(file.into_std().await);
+        let mut lines = Vec::new();
+        let mut current_line = 0;
+
+        // Skip to start line
+        let mut line_buf = String::new();
+        while current_line < start_line {
+            line_buf.clear();
+            if reader.read_line(&mut line_buf)? == 0 {
+                break; // EOF
+            }
+            current_line += 1;
+        }
+
+        // Read window
+        for _ in 0..window_size {
+            line_buf.clear();
+            if reader.read_line(&mut line_buf)? == 0 {
+                break; // EOF
+            }
+            lines.push(line_buf.trim_end_matches('\n').to_string());
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub fn calculate_search_result_line_offset(&self, search_result: &SearchResult) -> usize {
@@ -403,9 +394,4 @@ impl Engine {
         // chunk.start_line is 1-based, scroll offset is 0-based
         search_result.chunk.start_line.saturating_sub(1)
     }
-
-    // TODO: Reimplement to count chunks from LanceDB
-    // fn count_chunks_in_db() -> Result<usize> {
-    //     Ok(0)
-    // }
 }

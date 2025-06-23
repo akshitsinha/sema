@@ -29,13 +29,6 @@ impl UI {
             AppStateEnum::Crawling | AppStateEnum::Chunking | AppStateEnum::Ready => {
                 Self::render_main_interface(f, area, engine);
             }
-            AppStateEnum::DownloadingModel => {
-                Self::render_main_interface(f, area, engine);
-            }
-            AppStateEnum::GeneratingEmbeddings => {
-                Self::render_main_interface(f, area, engine);
-            }
-            AppStateEnum::Searching => Self::render_main_interface(f, area, engine),
         }
     }
 
@@ -72,10 +65,9 @@ impl UI {
         let (title, message) = Self::get_status_message(
             &engine.app_state.state,
             engine.spinner_frame,
-            &engine.search_input,
+            engine.search_input.value(),
             &engine.crawling_stats,
             &engine.processing_stats,
-            &engine.embedding_stats,
         );
 
         let status_block = Block::default()
@@ -261,34 +253,24 @@ impl UI {
             let file_display_path =
                 Self::get_display_path(&selected_result.chunk.file_path, &engine.root_path);
 
-            // Use cached file content if available, otherwise fall back to chunk content
-            let content_to_display = if let Some(ref cached_content) = engine.cached_file_content {
-                if let Some(ref cached_path) = engine.cached_file_path {
-                    if cached_path == &selected_result.chunk.file_path {
-                        cached_content.as_str()
+            // Check if content is loaded for the current file
+            let content_to_display = if let Some(ref current_content) = engine.current_file_content
+            {
+                if let Some(ref current_path) = engine.current_file_path {
+                    if current_path == &selected_result.chunk.file_path {
+                        current_content.as_str()
                     } else {
-                        &selected_result.chunk.content
+                        "Loading file..."
                     }
                 } else {
-                    &selected_result.chunk.content
+                    "Loading file..."
                 }
             } else {
-                &selected_result.chunk.content
+                "Loading file..."
             };
 
-            // Adjust title based on whether we're showing full file or just chunk
-            let title = if engine.cached_file_content.is_some()
-                && engine.cached_file_path.as_ref() == Some(&selected_result.chunk.file_path)
-            {
-                format!(" {} ", file_display_path)
-            } else {
-                format!(
-                    " {} (Lines {}-{}) ",
-                    file_display_path,
-                    selected_result.chunk.start_line,
-                    selected_result.chunk.end_line
-                )
-            };
+            // Always show as full file view
+            let title = format!(" {} ", file_display_path);
 
             let preview_block = Block::default()
                 .borders(Borders::ALL)
@@ -308,13 +290,6 @@ impl UI {
                 engine.file_preview_scroll_offset,
                 area.height.saturating_sub(2) as usize,
                 &engine.current_search_query,
-                if engine.cached_file_content.is_some()
-                    && engine.cached_file_path.as_ref() == Some(&selected_result.chunk.file_path)
-                {
-                    None // Don't pass chunk info when showing full file
-                } else {
-                    Some(&selected_result.chunk) // Pass chunk info when showing chunk only
-                },
             );
 
             let preview_para = Paragraph::new(content_lines)
@@ -350,8 +325,15 @@ impl UI {
         scroll_offset: usize,
         visible_lines: usize,
         search_query: &str,
-        _chunk: Option<&crate::types::Chunk>,
     ) -> Vec<Line<'static>> {
+        // Handle empty content case
+        if content.is_empty() {
+            return vec![Line::from(vec![Span::styled(
+                "  1 │ (empty file)",
+                Style::default().fg(Color::DarkGray),
+            )])];
+        }
+
         let extension = file_path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -384,12 +366,16 @@ impl UI {
         };
 
         let total_lines = content.lines().count();
-        let line_number_width = (total_lines + scroll_offset).to_string().len().max(3);
 
-        content
+        // Ensure scroll offset doesn't go beyond content
+        let safe_scroll_offset = scroll_offset.min(total_lines.saturating_sub(1));
+
+        let line_number_width = (total_lines + safe_scroll_offset).to_string().len().max(3);
+
+        let result: Vec<Line> = content
             .lines()
             .enumerate()
-            .skip(scroll_offset)
+            .skip(safe_scroll_offset)
             .take(visible_lines)
             .map(|(line_index, line)| {
                 let line_number = line_index + 1;
@@ -493,7 +479,9 @@ impl UI {
                     }
                 }
             })
-            .collect()
+            .collect();
+
+        result
     }
 
     fn render_search_input(f: &mut Frame, area: Rect, engine: &Engine) {
@@ -504,7 +492,7 @@ impl UI {
         if let Some(ref error) = engine.search_error {
             title = format!(" Search - {} ", error);
         } else if !engine.search_results.is_empty()
-            && !engine.search_input.trim().is_empty()
+            && !engine.search_input.value().trim().is_empty()
             && matches!(engine.focused_window, FocusedWindow::SearchInput)
         {
             // Only show results count when search input is focused and has content
@@ -523,23 +511,22 @@ impl UI {
             )
             .style(Style::default().bg(Color::Reset));
 
-        let search_text = if engine.search_input.is_empty() {
-            "Type your search query..."
-        } else {
-            &engine.search_input
-        };
+        // Calculate width for visual scrolling (accounting for borders)
+        let width = area.width.max(3) - 3;
+        let scroll = engine.search_input.visual_scroll(width as usize);
 
-        let text_style = if engine.search_input.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Reset)
-        };
-
-        let search_para = Paragraph::new(search_text)
-            .style(text_style)
+        let input_widget = Paragraph::new(engine.search_input.value())
+            .scroll((0, scroll as u16))
             .block(search_block);
 
-        f.render_widget(search_para, area);
+        f.render_widget(input_widget, area);
+
+        // Set cursor position if the search input is focused
+        if is_focused {
+            // Position the cursor past the end of the input text and one line down from the border
+            let x = engine.search_input.visual_cursor().max(scroll) - scroll + 1;
+            f.set_cursor_position((area.x + x as u16, area.y + 1));
+        }
     }
 
     fn get_status_message(
@@ -548,7 +535,6 @@ impl UI {
         search_input: &str,
         crawling_stats: &Option<(usize, f64)>,
         processing_stats: &Option<(usize, f64)>,
-        embedding_stats: &Option<(usize, f64)>,
     ) -> (String, &'static str) {
         match state {
             AppStateEnum::Crawling => {
@@ -563,20 +549,6 @@ impl UI {
                 (
                     format!(" {} Processing files... ", spinner_char),
                     "Breaking files into searchable chunks.\nAlmost ready for search!",
-                )
-            }
-            AppStateEnum::DownloadingModel => {
-                let spinner_char = Self::get_spinner_char(spinner_frame);
-                (
-                    format!(" {} Downloading model... ", spinner_char),
-                    "Downloading embedding model from Hugging Face.\nThis may take a while on first run.",
-                )
-            }
-            AppStateEnum::GeneratingEmbeddings => {
-                let spinner_char = Self::get_spinner_char(spinner_frame);
-                (
-                    format!(" {} Generating embeddings... ", spinner_char),
-                    "Creating semantic embeddings for search.\nAlmost ready for semantic search!",
                 )
             }
             AppStateEnum::Ready => {
@@ -616,23 +588,6 @@ impl UI {
                                 proc_time_value,
                                 proc_time_unit
                             );
-
-                            if let Some((emb_count, emb_duration)) = embedding_stats {
-                                let emb_time_unit =
-                                    if *emb_duration < 1.0 { "ms" } else { "seconds" };
-                                let emb_time_value = if *emb_duration < 1.0 {
-                                    emb_duration * 1000.0
-                                } else {
-                                    *emb_duration
-                                };
-                                title = format!(
-                                    "{} - Generated {} embeddings in {:.1} {}",
-                                    title.trim_end(),
-                                    emb_count,
-                                    emb_time_value,
-                                    emb_time_unit
-                                );
-                            }
                         }
 
                         message = "Processing completed! Semantic search ready.\nType your search query and press Enter to search.";
@@ -646,7 +601,6 @@ impl UI {
                     )
                 }
             }
-            _ => (" Search ".to_string(), "Type your search query."),
         }
     }
 
