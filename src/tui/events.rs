@@ -4,7 +4,7 @@ use tui_input::{Input, backend::crossterm::EventHandler as InputEventHandler};
 
 pub enum EventResult {
     ExecuteSearch(String),
-    OpenFile, // Open the current selected file
+    OpenFile,
     Continue,
     Quit,
 }
@@ -21,9 +21,10 @@ impl EventHandler {
         file_preview_scroll_offset: &mut usize,
         search_results_len: usize,
         current_search_result: Option<&SearchResult>,
+        terminal_height: u16,
     ) -> EventResult {
-        // Calculate results per page based on terminal height (approximation)
-        let results_per_page = 6; // Each result takes 3 lines, so ~6 results per typical screen
+        // Calculate results per page based on terminal height
+        let results_per_page = ((terminal_height.saturating_sub(2)) / 3).max(1) as usize;
 
         match key.code {
             KeyCode::Char('q') => EventResult::Quit,

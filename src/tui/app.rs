@@ -92,7 +92,8 @@ impl App {
 
             if crossterm::event::poll(Duration::from_millis(POLL_INTERVAL_MS))? {
                 if let Ok(event) = event::read() {
-                    needs_redraw = self.handle_event(event).await;
+                    let terminal_size = terminal.size()?;
+                    needs_redraw = self.handle_event(event, terminal_size.height).await;
                 }
             }
 
@@ -151,7 +152,7 @@ impl App {
         }
     }
 
-    async fn handle_event(&mut self, event: Event) -> bool {
+    async fn handle_event(&mut self, event: Event, terminal_height: u16) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if self.engine.search_error.is_some() {
@@ -179,6 +180,7 @@ impl App {
                             &mut self.engine.file_preview_scroll_offset,
                             self.engine.search_results.len(),
                             current_search_result,
+                            terminal_height,
                         )
                         .await
                     }

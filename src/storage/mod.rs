@@ -71,9 +71,27 @@ impl StorageManager {
     }
 
     async fn calculate_file_hash_from_path(file_path: &Path) -> Result<String> {
-        let content = tokio::fs::read_to_string(file_path).await?;
+        let metadata = tokio::fs::metadata(file_path).await?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(content.as_bytes());
+
+        if metadata.len() <= 1024 * 1024 {
+            // For files <= 1MB, read all at once
+            let contents = tokio::fs::read(file_path).await?;
+            hasher.update(&contents);
+        } else {
+            // For larger files, use streaming with 128KB buffer
+            let mut file = tokio::fs::File::open(file_path).await?;
+            let mut buffer = [0; 131072];
+
+            loop {
+                let bytes_read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
+                if bytes_read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes_read]);
+            }
+        }
+
         Ok(hasher.finalize().to_hex().to_string())
     }
 
