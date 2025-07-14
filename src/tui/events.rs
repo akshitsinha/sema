@@ -1,5 +1,5 @@
 use crate::types::{SearchResult, UIMode};
-use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use tui_input::{Input, backend::crossterm::EventHandler as InputEventHandler};
 
 pub enum EventResult {
@@ -151,24 +151,24 @@ impl EventHandler {
             }
             KeyCode::Backspace | KeyCode::Delete => {
                 if matches!(*ui_mode, UIMode::SearchInput) {
-                    search_input.handle_event(&crossterm::event::Event::Key(*key));
+                    search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 }
                 EventResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
                 if matches!(*ui_mode, UIMode::SearchInput) {
-                    search_input.handle_event(&crossterm::event::Event::Key(*key));
+                    search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 }
                 EventResult::Continue
             }
             KeyCode::Char(c) => {
                 if matches!(*ui_mode, UIMode::SearchInput) {
                     // Handle Ctrl+A, Ctrl+W, etc.
-                    search_input.handle_event(&crossterm::event::Event::Key(*key));
+                    search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 } else if c == 'c'
                     && key
                         .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
                 {
                     // Ctrl+C to quit
                     return EventResult::Quit;
@@ -185,20 +185,20 @@ impl EventHandler {
             KeyCode::Char('c')
                 if key
                     .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
             {
                 EventResult::Quit
             }
             KeyCode::Backspace | KeyCode::Delete => {
-                search_input.handle_event(&crossterm::event::Event::Key(*key));
+                search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 EventResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
-                search_input.handle_event(&crossterm::event::Event::Key(*key));
+                search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 EventResult::Continue
             }
             KeyCode::Char(_) => {
-                search_input.handle_event(&crossterm::event::Event::Key(*key));
+                search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 EventResult::Continue
             }
             _ => EventResult::Continue,

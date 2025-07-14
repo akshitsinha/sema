@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::{
+use ratatui::crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton,
         MouseEventKind,
@@ -90,7 +90,7 @@ impl App {
                 needs_redraw = false;
             }
 
-            if crossterm::event::poll(Duration::from_millis(POLL_INTERVAL_MS))? {
+            if ratatui::crossterm::event::poll(Duration::from_millis(POLL_INTERVAL_MS))? {
                 if let Ok(event) = event::read() {
                     let terminal_size = terminal.size()?;
                     needs_redraw = self.handle_event(event, terminal_size.height).await;
