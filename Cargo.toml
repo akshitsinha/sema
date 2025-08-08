@@ -58,7 +58,7 @@ rayon = "1.10.0"
 
 # Semantic search
 ort = "2.0.0-rc.9"
-lancedb = "0.21.0"
+lancedb = "0.21.2"
 arrow = "55.1.0"
 arrow-array = "55.1.0"
 arrow-schema = "55.1.0"

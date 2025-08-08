@@ -1,64 +1,91 @@
 # Sema
 
-A semantic search tool for codebases that uses AI embeddings to find relevant code snippets across your projects.
+**⚠️ EXPERIMENTAL PROJECT - ACTIVE DEVELOPMENT**
+
+This project is in early development. A lot of things don't work as expected, most notably improving the accuracy and performance of semantic analysis will take time.
+
+## The Problem
+
+Managing large collections of knowledge scattered across your system is challenging. Whether you have research papers, books, documentation, or notes spread across different folders, finding specific information often requires either:
+
+- Manually browsing through directories hoping to locate the right file
+- Using basic search tools that only match exact keywords, missing conceptually related content
+- Remembering precise wording from documents you read weeks or months ago
+
+Sema addresses this by enabling natural language queries that find semantically relevant content across your entire knowledge base.
 
 ## What is Sema?
 
-Sema is a terminal-based semantic search engine for source code. Unlike traditional text-based search tools like `grep` or `ripgrep`, Sema understands the meaning and context of your code, allowing you to search for functionality rather than just exact text matches.
+Sema is a semantic search tool that understands the meaning behind your queries rather than just matching keywords. It allows you to search your personal collection of documents, code, and notes using natural questions and concepts.
+
+## Example Queries
+
+**Literature and books:**
+
+- "What did Aristotle say about friendship?"
+- "How do science fiction authors approach time travel?"
+- "What strategies did Napoleon use in the Russian campaign?"
+
+**Research and documentation:**
+
+- "Best practices for user authentication"
+- "How does overfitting work in machine learning?"
+- "What caused the 2008 financial crisis?"
+
+**Technical knowledge:**
+
+- "Database optimization techniques for large datasets"
+- "Common microservices communication patterns"
+
+You can ask questions naturally without needing to remember exact phrases or terminology.
 
 ## Features
 
-- **Semantic Search**: Find code by meaning, not just keywords
-- **Interactive TUI**: Clean terminal interface for browsing results
-- **File Preview**: View full files with automatic positioning at relevant sections
-- **Fast Indexing**: Efficient crawling and chunking of codebases
-- **Vector Storage**: Uses Lance for high-performance vector search
+- Natural language search using semantic understanding
+- Interactive terminal interface for browsing results
+- File preview with automatic positioning at relevant sections
+- Fast indexing and search performance
+- Support for various text file formats (markdown, code, PDFs TODO, etc.)
 
-## Installation
+## Installation and Usage
+
+Requirements: Rust toolchain
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd sema
-
-# Build the project
 cargo build --release
-
-# Install locally
 cargo install --path .
 ```
 
-## Usage
+Basic usage:
 
 ```bash
-# Search in current directory
+# Search current directory
 sema
 
-# Search in specific directory
-sema /path/to/your/codebase
+# Search specific directory
+sema /path/to/your/content
 ```
 
-### Navigation
+![sema](https://github.com/user-attachments/assets/f9c0bf6b-3d49-49a6-a9d1-64541772821e)
 
-- **Search**: Type your query and press Enter
-- **Browse Results**: Use ↑/↓ arrow keys to navigate search results
-- **Preview Files**: Press Enter to open file preview
-- **Scroll Preview**: Use ↑/↓ in preview mode to scroll through files
-- **Return to Search**: Press Esc to return to search input
-- **Quit**: Press Ctrl+C or q to exit
+**Navigation:**
+
+- Type your query and press Enter
+- Use arrow keys to browse results
+- Press Enter to preview files
+- Press Esc to return to search
+- Press Ctrl+C or 'q' to exit
 
 ## How It Works
 
-1. **Crawling**: Discovers all source files in your directory
-2. **Chunking**: Breaks files into meaningful code segments
-3. **Embedding**: Generates semantic embeddings for each chunk
-4. **Indexing**: Stores embeddings in a vector database
-5. **Search**: Finds semantically similar code based on your query
+Sema scans your files, generates semantic embeddings using AI models, and builds a searchable index. When you submit a query, it finds content that matches the conceptual meaning rather than just exact keyword matches.
 
 ## Configuration
 
-Sema can be configured using the `~/.sema/config.toml` file.
+Settings can be customized in `~/.sema/config.toml`.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
+MIT License - see [LICENSE.md](LICENSE.md) for details.
