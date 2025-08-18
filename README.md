@@ -2,7 +2,9 @@
 
 **⚠️ EXPERIMENTAL PROJECT - ACTIVE DEVELOPMENT**
 
-This project is in early development. A lot of things don't work as expected, most notably improving the accuracy and performance of semantic analysis will take time.
+This project is in early development. Many features are incomplete, and accuracy and performance of semantic analysis require significant improvement.
+
+**Note:** A more functional proof-of-concept implementation is available in Python at [sema-py](https://github.com/akshitsinha/sema-py). The Python version benefits from better GPU acceleration support for model inference, whereas this Rust implementation is currently limited by available ML runtime libraries.
 
 ## The Problem
 
