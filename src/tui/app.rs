@@ -119,14 +119,14 @@ impl App {
 
     async fn process_state_updates(&mut self) {
         while let Ok(update) = self.state_rx.try_recv() {
+            self.engine.data_changed = true;
+            
             match update {
                 StateUpdate::FileFound(file) => {
                     self.engine.app_state.crawled_files.push(file);
-                    self.engine.data_changed = true;
                 }
                 StateUpdate::StateChanged(new_state) => {
                     self.engine.app_state.state = new_state;
-                    self.engine.data_changed = true;
                 }
                 StateUpdate::AllFilesCollected(files) => {
                     let state_tx = self.state_tx.clone();
@@ -134,19 +134,11 @@ impl App {
                         Engine::start_chunking(state_tx, files).await;
                     });
                 }
-                StateUpdate::CrawlingCompleted {
-                    files_count,
-                    duration_secs,
-                } => {
+                StateUpdate::CrawlingCompleted { files_count, duration_secs } => {
                     self.engine.crawling_stats = Some((files_count, duration_secs));
-                    self.engine.data_changed = true;
                 }
-                StateUpdate::ProcessingCompleted {
-                    chunks_count,
-                    duration_secs,
-                } => {
+                StateUpdate::ProcessingCompleted { chunks_count, duration_secs } => {
                     self.engine.processing_stats = Some((chunks_count, duration_secs));
-                    self.engine.data_changed = true;
                 }
             }
         }
@@ -155,52 +147,34 @@ impl App {
     async fn handle_event(&mut self, event: Event, terminal_height: u16) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if self.engine.search_error.is_some() {
-                    self.engine.search_error = None;
-                }
-
+                self.engine.search_error = None;
                 let prev_selected = self.engine.selected_search_result;
 
-                let result = match self.engine.app_state.state {
-                    crate::types::AppState::Ready => {
-                        let current_search_result = if !self.engine.search_results.is_empty()
-                            && self.engine.selected_search_result < self.engine.search_results.len()
-                        {
-                            Some(&self.engine.search_results[self.engine.selected_search_result])
-                        } else {
-                            None
-                        };
-
-                        EventHandler::handle_key_input(
-                            &key,
-                            &mut self.engine.search_input,
-                            &mut self.engine.ui_mode,
-                            &mut self.engine.selected_search_result,
-                            &mut self.engine.search_results_scroll_offset,
-                            &mut self.engine.file_preview_scroll_offset,
-                            self.engine.search_results.len(),
-                            current_search_result,
-                            terminal_height,
-                        )
-                        .await
-                    }
-                    _ => EventHandler::handle_non_ready_input(&key, &mut self.engine.search_input),
+                let result = if matches!(self.engine.app_state.state, crate::types::AppState::Ready) {
+                    let current_result = self.engine.search_results.get(self.engine.selected_search_result);
+                    EventHandler::handle_key_input(
+                        &key,
+                        &mut self.engine.search_input,
+                        &mut self.engine.ui_mode,
+                        &mut self.engine.selected_search_result,
+                        &mut self.engine.search_results_scroll_offset,
+                        &mut self.engine.file_preview_scroll_offset,
+                        self.engine.search_results.len(),
+                        current_result,
+                        terminal_height,
+                    )
+                    .await
+                } else {
+                    EventHandler::handle_non_ready_input(&key, &mut self.engine.search_input)
                 };
 
                 match result {
-                    EventResult::ExecuteSearch(query) => {
-                        self.execute_search(&query).await;
-                    }
-                    EventResult::OpenFile => {
-                        self.open_file().await;
-                    }
-                    EventResult::Quit => {
-                        self.engine.should_quit = true;
-                    }
+                    EventResult::ExecuteSearch(query) => self.execute_search(&query).await,
+                    EventResult::OpenFile => self.open_file().await,
+                    EventResult::Quit => self.engine.should_quit = true,
                     EventResult::Continue => {}
                 }
 
-                // Only sync file preview if selection changed
                 if self.engine.selected_search_result != prev_selected {
                     self.sync_file_preview().await;
                 }
@@ -208,9 +182,7 @@ impl App {
                 self.engine.update_focused_window();
                 true
             }
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) => {
                 self.engine.focused_window = FocusedWindow::SearchInput;
                 if matches!(self.engine.app_state.state, crate::types::AppState::Ready)
                     && !self.engine.search_results.is_empty()
@@ -224,7 +196,7 @@ impl App {
     }
 
     async fn execute_search(&mut self, query: &str) {
-        if query.trim().is_empty() || query.trim().len() <= 2 {
+        if query.trim().len() <= 2 {
             self.engine.clear_search();
             return;
         }
@@ -235,75 +207,36 @@ impl App {
             return;
         }
 
-        // Load first result for preview
-        if !self.engine.search_results.is_empty() {
-            let first_result = self.engine.search_results[0].clone();
-            let file_path = &first_result.chunk.file_path;
-
-            self.engine.update_current_file_content(file_path).await;
-
-            let scroll_offset = self
-                .engine
-                .calculate_search_result_line_offset(&first_result);
-            self.engine.file_preview_scroll_offset = scroll_offset;
+        if let Some(first) = self.engine.search_results.first().cloned() {
+            self.engine.update_current_file_content(&first.chunk.file_path).await;
+            self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&first);
         }
     }
 
     async fn open_file(&mut self) {
-        let selected_result = if let Some(result) = self
-            .engine
-            .search_results
-            .get(self.engine.selected_search_result)
-        {
-            result.clone()
-        } else {
+        let Some(result) = self.engine.search_results.get(self.engine.selected_search_result).cloned() else {
             self.engine.ui_mode = crate::types::UIMode::FilePreview;
             self.engine.update_focused_window();
             return;
         };
 
-        let file_path = &selected_result.chunk.file_path;
-
-        self.engine.update_current_file_content(file_path).await;
-
-        let scroll_offset = self
-            .engine
-            .calculate_search_result_line_offset(&selected_result);
-
-        self.engine.file_preview_scroll_offset = scroll_offset;
+        self.engine.update_current_file_content(&result.chunk.file_path).await;
+        self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&result);
         self.engine.ui_mode = crate::types::UIMode::FilePreview;
         self.engine.update_focused_window();
     }
 
     async fn sync_file_preview(&mut self) {
-        let selected_result = if let Some(result) = self
-            .engine
-            .search_results
-            .get(self.engine.selected_search_result)
-        {
-            result.clone()
-        } else {
+        let Some(result) = self.engine.search_results.get(self.engine.selected_search_result).cloned() else {
             return;
         };
 
-        let file_path = &selected_result.chunk.file_path;
-
-        // Check if we need to load a different file
-        let needs_new_file = if let Some(current_path) = &self.engine.current_file_path {
-            current_path != file_path
-        } else {
-            true
-        };
-
-        if needs_new_file {
-            self.engine.update_current_file_content(file_path).await;
+        let needs_load = self.engine.current_file_path.as_ref() != Some(&result.chunk.file_path);
+        if needs_load {
+            self.engine.update_current_file_content(&result.chunk.file_path).await;
         }
 
-        // Always set the scroll offset to the chunk position
-        let scroll_offset = self
-            .engine
-            .calculate_search_result_line_offset(&selected_result);
-        self.engine.file_preview_scroll_offset = scroll_offset;
+        self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&result);
     }
 
     fn should_update_spinner(&self) -> bool {

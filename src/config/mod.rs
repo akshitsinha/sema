@@ -58,16 +58,15 @@ impl Default for GeneralConfig {
                 "ps1".to_string(),
                 "bat".to_string(),
                 "r".to_string(),
-                "jl".to_string(), // Julia
-                "hs".to_string(), // Haskell
+                "jl".to_string(),
+                "hs".to_string(),
                 "elm".to_string(),
-                "clj".to_string(), // Clojure
-                "ex".to_string(),  // Elixir
-                "erl".to_string(), // Erlang
+                "clj".to_string(),
+                "ex".to_string(),
+                "erl".to_string(),
                 "vim".to_string(),
                 "asm".to_string(),
                 "s".to_string(),
-                // Web technologies
                 "html".to_string(),
                 "htm".to_string(),
                 "css".to_string(),
@@ -76,7 +75,6 @@ impl Default for GeneralConfig {
                 "less".to_string(),
                 "vue".to_string(),
                 "svelte".to_string(),
-                // Configuration & data formats
                 "json".to_string(),
                 "yaml".to_string(),
                 "yml".to_string(),
@@ -87,7 +85,6 @@ impl Default for GeneralConfig {
                 "conf".to_string(),
                 "properties".to_string(),
                 "env".to_string(),
-                // Documentation & text
                 "md".to_string(),
                 "markdown".to_string(),
                 "txt".to_string(),
@@ -96,11 +93,9 @@ impl Default for GeneralConfig {
                 "asciidoc".to_string(),
                 "tex".to_string(),
                 "rtf".to_string(),
-                // Database & query languages
                 "sql".to_string(),
                 "graphql".to_string(),
                 "gql".to_string(),
-                // Misc
                 "log".to_string(),
                 "csv".to_string(),
                 "tsv".to_string(),

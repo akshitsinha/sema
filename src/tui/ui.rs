@@ -13,7 +13,6 @@ use crate::types::{AppState as AppStateEnum, FocusedWindow, UIMode};
 
 const LAYOUT_SPLIT_PERCENTAGE: u16 = 30;
 
-// Syntax highlighting setup
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
@@ -33,13 +32,11 @@ impl UI {
     }
 
     fn render_main_interface(f: &mut Frame, area: Rect, engine: &mut Engine) {
-        // If we have search results and we're in Ready state, show search interface
         if !engine.search_results.is_empty()
             && matches!(engine.app_state.state, AppStateEnum::Ready)
         {
             Self::render_search_interface(f, area, engine);
         } else {
-            // Show status screen
             Self::render_status_screen(f, area, engine);
         }
     }
@@ -61,7 +58,6 @@ impl UI {
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
 
-        // Status message
         let (title, message) = Self::get_status_message(
             &engine.app_state.state,
             engine.spinner_frame,
@@ -97,7 +93,6 @@ impl UI {
 
         f.render_widget(status_para, chunks[0]);
 
-        // Search input
         Self::render_search_input(f, chunks[1], engine);
     }
 
@@ -115,13 +110,8 @@ impl UI {
             ])
             .split(main_chunks[0]);
 
-        // Left: Search results
         Self::render_search_results(f, chunks[0], engine);
-
-        // Right: File preview
         Self::render_file_preview(f, chunks[1], engine);
-
-        // Bottom: Search input
         Self::render_search_input(f, main_chunks[1], engine);
     }
 
@@ -129,7 +119,6 @@ impl UI {
         let is_focused = matches!(engine.focused_window, FocusedWindow::SearchResults);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
-        // Build title with timing info if available and not yet shown
         let mut title = format!(" Search Results ({}) ", engine.search_results.len());
         if !engine.timing_shown {
             if let (Some((_, crawl_time)), Some((_, process_time))) =
@@ -141,7 +130,7 @@ impl UI {
                     engine.search_results.len(),
                     total_time
                 );
-                engine.timing_shown = true; // Mark as shown so it disappears after first display
+                engine.timing_shown = true;
             }
         }
 
@@ -167,7 +156,6 @@ impl UI {
         }
 
         let visible_height = area.height.saturating_sub(2) as usize;
-        // Each result takes 3 lines (filename, line info, separator), so divide by 3
         let results_per_page = (visible_height / 3).max(1);
         let start_index = engine.search_results_scroll_offset;
         let end_index = (start_index + results_per_page).min(engine.search_results.len());
@@ -194,14 +182,12 @@ impl UI {
                     )
                 };
 
-                // Calculate spacing for right alignment of line numbers
-                let available_width = area.width.saturating_sub(4) as usize; // Account for borders
+                let available_width = area.width.saturating_sub(4) as usize;
                 let results_count_len = results_count.len();
                 let line_range_len = line_range.len();
                 let middle_padding =
                     available_width.saturating_sub(results_count_len + line_range_len);
 
-                // Only highlight filename when selected, not the entire line
                 let filename_style = if is_selected {
                     Style::default()
                         .bg(Color::Blue)
@@ -233,7 +219,7 @@ impl UI {
                     Line::from(vec![Span::styled(
                         "─".repeat(available_width),
                         Style::default().fg(Color::DarkGray),
-                    )]), // Border line between results
+                    )]),
                 ])
             })
             .collect();
@@ -253,7 +239,6 @@ impl UI {
             let file_display_path =
                 Self::get_display_path(&selected_result.chunk.file_path, &engine.root_path);
 
-            // Check if content is loaded for the current file
             let content_to_display = if let Some(ref current_content) = engine.current_file_content
             {
                 if let Some(ref current_path) = engine.current_file_path {
@@ -269,7 +254,6 @@ impl UI {
                 "Loading file..."
             };
 
-            // Always show as full file view
             let title = format!(" {} ", file_display_path);
 
             let preview_block = Block::default()
@@ -326,7 +310,6 @@ impl UI {
         visible_lines: usize,
         search_query: &str,
     ) -> Vec<Line<'static>> {
-        // Handle empty content case
         if content.is_empty() {
             return vec![Line::from(vec![Span::styled(
                 "  1 │ (empty file)",
@@ -347,14 +330,11 @@ impl UI {
         let theme = &THEME_SET.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
-        // Determine if this is semantic search vs text search
         let is_semantic_search = !search_query.trim().starts_with('\'');
 
         let search_terms: Vec<&str> = if is_semantic_search {
-            // For semantic search, don't highlight query terms
             Vec::new()
         } else {
-            // For text search, highlight query terms (remove the ' prefix)
             let query = search_query
                 .trim()
                 .strip_prefix('\'')
@@ -366,8 +346,6 @@ impl UI {
         };
 
         let total_lines = content.lines().count();
-
-        // Ensure scroll offset doesn't go beyond content
         let safe_scroll_offset = scroll_offset.min(total_lines.saturating_sub(1));
 
         let line_number_width = (total_lines + safe_scroll_offset).to_string().len().max(3);
@@ -381,12 +359,9 @@ impl UI {
                 let line_number = line_index + 1;
                 let line_num_str = format!("{:>width$} │ ", line_number, width = line_number_width);
 
-                // Skip semantic term highlighting for semantic search
                 if is_semantic_search {
-                    // Use syntax highlighting but no semantic highlighting
                     match highlighter.highlight_line(line, &SYNTAX_SET) {
                         Ok(ranges) => {
-                            // Apply syntax highlighting only
                             let mut spans: Vec<Span> = vec![Span::styled(
                                 line_num_str,
                                 Style::default().fg(Color::DarkGray),
@@ -408,7 +383,6 @@ impl UI {
                             Line::from(spans)
                         }
                         Err(_) => {
-                            // Fallback: plain text
                             let spans = vec![
                                 Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
                                 Span::styled(line.to_string(), Style::default()),
@@ -417,10 +391,8 @@ impl UI {
                         }
                     }
                 } else {
-                    // Use syntax highlighting for text search
                     match highlighter.highlight_line(line, &SYNTAX_SET) {
                         Ok(ranges) => {
-                            // Apply syntax highlighting first
                             let mut spans: Vec<Span> = vec![Span::styled(
                                 line_num_str,
                                 Style::default().fg(Color::DarkGray),
@@ -440,9 +412,7 @@ impl UI {
 
                             spans.extend(content_spans);
 
-                            // Apply highlighting based on search type
                             if !search_terms.is_empty() {
-                                // Text search: highlight query terms
                                 let (line_num_span, content_spans) = spans.split_first().unwrap();
                                 let highlighted_content = Self::highlight_search_terms(
                                     content_spans.to_vec(),
@@ -456,14 +426,12 @@ impl UI {
                             }
                         }
                         Err(_) => {
-                            // Fallback: plain text with highlighting
                             let spans = vec![
                                 Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
                                 Span::styled(line.to_string(), Style::default()),
                             ];
 
                             if !search_terms.is_empty() {
-                                // Text search: highlight query terms
                                 let (line_num_span, content_spans) = spans.split_first().unwrap();
                                 let highlighted_content = Self::highlight_search_terms(
                                     content_spans.to_vec(),
@@ -495,7 +463,6 @@ impl UI {
             && !engine.search_input.value().trim().is_empty()
             && matches!(engine.focused_window, FocusedWindow::SearchInput)
         {
-            // Only show results count when search input is focused and has content
             title = format!(" Search - {} results ", engine.search_results.len());
         }
 
@@ -511,7 +478,6 @@ impl UI {
             )
             .style(Style::default().bg(Color::Reset));
 
-        // Calculate width for visual scrolling (accounting for borders)
         let width = area.width.max(3) - 3;
         let scroll = engine.search_input.visual_scroll(width as usize);
 
@@ -521,9 +487,7 @@ impl UI {
 
         f.render_widget(input_widget, area);
 
-        // Set cursor position if the search input is focused
         if is_focused {
-            // Position the cursor past the end of the input text and one line down from the border
             let x = engine.search_input.visual_cursor().max(scroll) - scroll + 1;
             f.set_cursor_position((area.x + x as u16, area.y + 1));
         }
@@ -538,60 +502,39 @@ impl UI {
     ) -> (String, &'static str) {
         match state {
             AppStateEnum::Crawling => {
-                let spinner_char = Self::get_spinner_char(spinner_frame);
+                let spinner = Self::get_spinner_char(spinner_frame);
                 (
-                    format!(" {} Crawling files... ", spinner_char),
+                    format!(" {} Crawling files... ", spinner),
                     "Discovering files in the directory.\nYou can type your search query now.",
                 )
             }
             AppStateEnum::Chunking => {
-                let spinner_char = Self::get_spinner_char(spinner_frame);
+                let spinner = Self::get_spinner_char(spinner_frame);
                 (
-                    format!(" {} Processing files... ", spinner_char),
+                    format!(" {} Processing files... ", spinner),
                     "Breaking files into searchable chunks.\nAlmost ready for search!",
                 )
             }
             AppStateEnum::Ready => {
-                // Show completion stats if available and no search has been performed
                 if search_input.is_empty() {
-                    let mut title = " Ready to Search ".to_string();
-                    let mut message =
-                        "Type your search query and press Enter\nto search through indexed files.";
-
-                    if let Some((files_count, duration)) = crawling_stats {
-                        let time_unit = if *duration < 1.0 { "ms" } else { "seconds" };
-                        let time_value = if *duration < 1.0 {
-                            duration * 1000.0
-                        } else {
-                            *duration
-                        };
-                        title = format!(
-                            " Crawled {} files in {:.1} {} ",
-                            files_count, time_value, time_unit
-                        );
-
-                        if let Some((chunks_count, proc_duration)) = processing_stats {
-                            let proc_time_unit = if *proc_duration < 1.0 {
-                                "ms"
-                            } else {
-                                "seconds"
-                            };
-                            let proc_time_value = if *proc_duration < 1.0 {
-                                proc_duration * 1000.0
-                            } else {
-                                *proc_duration
-                            };
-                            title = format!(
-                                "{} - Processed {} chunks in {:.1} {}",
-                                title.trim_end(),
-                                chunks_count,
-                                proc_time_value,
-                                proc_time_unit
-                            );
+                    let title = match (crawling_stats, processing_stats) {
+                        (Some((files, duration)), Some((chunks, proc_dur))) => {
+                            format!(
+                                " Crawled {} files in {:.1}s - Processed {} chunks in {:.1}s ",
+                                files, duration, chunks, proc_dur
+                            )
                         }
+                        (Some((files, duration)), None) => {
+                            format!(" Crawled {} files in {:.1}s ", files, duration)
+                        }
+                        _ => " Ready to Search ".to_string(),
+                    };
 
-                        message = "Processing completed! Semantic search ready.\nType your search query and press Enter to search.";
-                    }
+                    let message = if crawling_stats.is_some() {
+                        "Processing completed! Semantic search ready.\nType your search query and press Enter to search."
+                    } else {
+                        "Type your search query and press Enter\nto search through indexed files."
+                    };
 
                     (title, message)
                 } else {
@@ -615,64 +558,53 @@ impl UI {
         for span in spans {
             let text = span.content.to_string();
             let style = span.style;
-            let mut current_pos = 0;
-
-            // Find all search term matches in this span
-            let mut matches = Vec::new();
             let text_lower = text.to_lowercase();
 
+            let mut matches = Vec::new();
             for term in search_terms {
                 let term_lower = term.to_lowercase();
-                let mut search_pos = 0;
-
-                while let Some(pos) = text_lower[search_pos..].find(&term_lower) {
-                    let abs_pos = search_pos + pos;
-                    matches.push((abs_pos, abs_pos + term.len()));
-                    search_pos = abs_pos + 1;
+                let mut pos = 0;
+                while let Some(idx) = text_lower[pos..].find(&term_lower) {
+                    let start = pos + idx;
+                    matches.push((start, start + term.len()));
+                    pos = start + 1;
                 }
             }
 
-            // Sort matches by position and merge overlapping ones
-            matches.sort_by_key(|&(start, _)| start);
-            let mut merged_matches = Vec::new();
+            if matches.is_empty() {
+                result.push(Span::styled(text, style));
+                continue;
+            }
 
+            matches.sort_by_key(|&(s, _)| s);
+
+            let mut merged = Vec::new();
             for (start, end) in matches {
-                if let Some(&mut (_, ref mut last_end)) = merged_matches.last_mut() {
+                if let Some(&mut (_, ref mut last_end)) = merged.last_mut() {
                     if start <= *last_end {
-                        *last_end = (*last_end).max(end);
+                        *last_end = end.max(*last_end);
                         continue;
                     }
                 }
-                merged_matches.push((start, end));
+                merged.push((start, end));
             }
 
-            // Split the span into highlighted and non-highlighted parts
-            if merged_matches.is_empty() {
-                // No matches, keep the original span
-                result.push(Span::styled(text, style));
-            } else {
-                for (start, end) in merged_matches {
-                    // Add text before the match
-                    if start > current_pos {
-                        result.push(Span::styled(text[current_pos..start].to_string(), style));
-                    }
-
-                    // Add the highlighted match
-                    result.push(Span::styled(
-                        text[start..end].to_string(),
-                        Style::default()
-                            .bg(Color::Yellow)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-
-                    current_pos = end;
+            let mut pos = 0;
+            for (start, end) in merged {
+                if start > pos {
+                    result.push(Span::styled(text[pos..start].to_string(), style));
                 }
-
-                // Add remaining text
-                if current_pos < text.len() {
-                    result.push(Span::styled(text[current_pos..].to_string(), style));
-                }
+                result.push(Span::styled(
+                    text[start..end].to_string(),
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                pos = end;
+            }
+            if pos < text.len() {
+                result.push(Span::styled(text[pos..].to_string(), style));
             }
         }
 
@@ -680,11 +612,9 @@ impl UI {
     }
 
     fn get_display_path(file_path: &std::path::Path, base_dir: &std::path::Path) -> String {
-        // Try to get a relative path from base directory
         if let Ok(relative) = file_path.strip_prefix(base_dir) {
             relative.to_string_lossy().to_string()
         } else {
-            // Fall back to showing the last 2 components if possible and not too long
             let components: Vec<_> = file_path.components().collect();
             if components.len() >= 2 {
                 let parent = components[components.len() - 2]
@@ -695,7 +625,6 @@ impl UI {
                     .to_string_lossy();
                 let display_path = format!("{}/{}", parent, filename);
 
-                // Check length, truncate if necessary
                 if display_path.len() > 50 {
                     format!("...{}", &display_path[display_path.len() - 47..])
                 } else {

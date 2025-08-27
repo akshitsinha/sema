@@ -45,7 +45,6 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
         config.general.ignore_gitignore = true;
     }
 
-    // Override file extensions if --extensions is provided
     if let Some(extensions) = &cli.extensions {
         config.general.file_extensions = extensions.clone();
     }

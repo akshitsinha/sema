@@ -23,7 +23,6 @@ impl EventHandler {
         current_search_result: Option<&SearchResult>,
         terminal_height: u16,
     ) -> EventResult {
-        // Calculate results per page based on terminal height
         let results_per_page = ((terminal_height.saturating_sub(2)) / 3).max(1) as usize;
 
         match key.code {
@@ -55,7 +54,6 @@ impl EventHandler {
                         EventResult::Continue
                     }
                     UIMode::SearchInput => {
-                        // Clear search input and results
                         search_input.reset();
                         EventResult::ExecuteSearch(String::new())
                     }
@@ -163,14 +161,12 @@ impl EventHandler {
             }
             KeyCode::Char(c) => {
                 if matches!(*ui_mode, UIMode::SearchInput) {
-                    // Handle Ctrl+A, Ctrl+W, etc.
                     search_input.handle_event(&ratatui::crossterm::event::Event::Key(*key));
                 } else if c == 'c'
                     && key
                         .modifiers
                         .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
                 {
-                    // Ctrl+C to quit
                     return EventResult::Quit;
                 }
                 EventResult::Continue

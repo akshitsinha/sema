@@ -30,23 +30,19 @@ impl StorageManager {
     pub async fn process_and_index_files(&mut self, files: Vec<PathBuf>) -> Result<usize> {
         let mut files_to_process = Vec::new();
 
-        // Check which files need processing
         for file_path in &files {
             if file_path.exists() {
                 let current_hash = Self::calculate_file_hash_from_path(file_path).await?;
 
                 match self.lance_indexer.get_file_index(file_path).await? {
                     Some(file_index) if file_index.hash == current_hash => {
-                        // File unchanged, skip
                         continue;
                     }
                     Some(_) => {
-                        // File changed, need to reprocess
                         self.lance_indexer.remove_file_chunks(file_path).await?;
                         files_to_process.push(file_path.clone());
                     }
                     None => {
-                        // New file, need to process
                         files_to_process.push(file_path.clone());
                     }
                 }
@@ -59,7 +55,6 @@ impl StorageManager {
         if !chunks.is_empty() {
             self.index_chunks(&chunks).await?;
 
-            // Update file indices
             for file_path in &files_to_process {
                 if let Ok(hash) = Self::calculate_file_hash_from_path(file_path).await {
                     let _ = self.lance_indexer.update_file_index(file_path, &hash).await;
@@ -75,11 +70,9 @@ impl StorageManager {
         let mut hasher = blake3::Hasher::new();
 
         if metadata.len() <= 1024 * 1024 {
-            // For files <= 1MB, read all at once
             let contents = tokio::fs::read(file_path).await?;
             hasher.update(&contents);
         } else {
-            // For larger files, use streaming with 128KB buffer
             let mut file = tokio::fs::File::open(file_path).await?;
             let mut buffer = [0; 131072];
 
@@ -115,14 +108,12 @@ impl StorageManager {
         let query = query.trim();
 
         if let Some(stripped) = query.strip_prefix('\'') {
-            // Text search mode - strip the leading quote
             if !stripped.is_empty() {
                 self.text_indexer.search(stripped, limit)
             } else {
                 Ok(Vec::new())
             }
         } else {
-            // Vector search mode
             let chunks = self.lance_indexer.search(query, limit).await?;
             Ok(chunks.into_iter().map(|c| (c, 1.0)).collect())
         }
