@@ -37,13 +37,6 @@ pub enum UIMode {
     FilePreview,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum FocusedWindow {
-    SearchInput,
-    SearchResults,
-    FilePreview,
-}
-
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub id: String,

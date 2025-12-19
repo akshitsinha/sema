@@ -5,16 +5,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
 };
-use std::sync::LazyLock;
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
 use super::engine::Engine;
-use crate::types::{AppState as AppStateEnum, FocusedWindow, UIMode};
+use crate::types::{AppState as AppStateEnum, UIMode};
 
 const LAYOUT_SPLIT_PERCENTAGE: u16 = 30;
-
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 pub struct UI;
 
@@ -24,7 +20,7 @@ impl UI {
         let background = Block::default().style(Style::default().bg(Color::Reset));
         f.render_widget(background, area);
 
-        match engine.app_state.state {
+        match engine.state {
             AppStateEnum::Crawling | AppStateEnum::Chunking | AppStateEnum::Ready => {
                 Self::render_main_interface(f, area, engine);
             }
@@ -32,9 +28,7 @@ impl UI {
     }
 
     fn render_main_interface(f: &mut Frame, area: Rect, engine: &mut Engine) {
-        if !engine.search_results.is_empty()
-            && matches!(engine.app_state.state, AppStateEnum::Ready)
-        {
+        if !engine.search_results.is_empty() && matches!(engine.state, AppStateEnum::Ready) {
             Self::render_search_interface(f, area, engine);
         } else {
             Self::render_status_screen(f, area, engine);
@@ -59,11 +53,9 @@ impl UI {
             .split(area);
 
         let (title, message) = Self::get_status_message(
-            &engine.app_state.state,
+            &engine.state,
             engine.spinner_frame,
             engine.search_input.value(),
-            &engine.crawling_stats,
-            &engine.processing_stats,
         );
 
         let status_block = Block::default()
@@ -116,23 +108,10 @@ impl UI {
     }
 
     fn render_search_results(f: &mut Frame, area: Rect, engine: &mut Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::SearchResults);
+        let is_focused = matches!(engine.ui_mode, UIMode::SearchResults);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
-        let mut title = format!(" Search Results ({}) ", engine.search_results.len());
-        if !engine.timing_shown {
-            if let (Some((_, crawl_time)), Some((_, process_time))) =
-                (&engine.crawling_stats, &engine.processing_stats)
-            {
-                let total_time = crawl_time + process_time;
-                title = format!(
-                    " Search Results ({}) - Indexed in {:.2}s ",
-                    engine.search_results.len(),
-                    total_time
-                );
-                engine.timing_shown = true;
-            }
-        }
+        let title = format!(" Search Results ({}) ", engine.search_results.len());
 
         let results_block = Block::default()
             .borders(Borders::ALL)
@@ -232,7 +211,7 @@ impl UI {
     }
 
     fn render_file_preview(f: &mut Frame, area: Rect, engine: &Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::FilePreview);
+        let is_focused = matches!(engine.ui_mode, UIMode::FilePreview);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
         if let Some(selected_result) = engine.search_results.get(engine.selected_search_result) {
@@ -317,17 +296,23 @@ impl UI {
             )])];
         }
 
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+
         let extension = file_path
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("");
 
-        let syntax = SYNTAX_SET
-            .find_syntax_by_extension(extension)
-            .or_else(|| SYNTAX_SET.find_syntax_by_first_line(content))
-            .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+        let syntax = match syntax_set.find_syntax_by_extension(extension) {
+            Some(s) => s,
+            None => match syntax_set.find_syntax_by_first_line(content) {
+                Some(s) => s,
+                None => syntax_set.find_syntax_plain_text(),
+            },
+        };
 
-        let theme = &THEME_SET.themes["base16-ocean.dark"];
+        let theme = &theme_set.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
         let is_semantic_search = !search_query.trim().starts_with('\'');
@@ -350,110 +335,112 @@ impl UI {
 
         let line_number_width = (total_lines + safe_scroll_offset).to_string().len().max(3);
 
-        let result: Vec<Line> = content
-            .lines()
-            .enumerate()
-            .skip(safe_scroll_offset)
-            .take(visible_lines)
-            .map(|(line_index, line)| {
-                let line_number = line_index + 1;
-                let line_num_str = format!("{:>width$} │ ", line_number, width = line_number_width);
+        let mut result: Vec<Line> = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
 
-                if is_semantic_search {
-                    match highlighter.highlight_line(line, &SYNTAX_SET) {
-                        Ok(ranges) => {
-                            let mut spans: Vec<Span> = vec![Span::styled(
-                                line_num_str,
-                                Style::default().fg(Color::DarkGray),
-                            )];
+        let start = safe_scroll_offset;
+        let end = (start + visible_lines).min(lines.len());
 
-                            let content_spans: Vec<Span> = ranges
-                                .iter()
-                                .map(|(style, text)| {
-                                    let fg_color = Color::Rgb(
-                                        style.foreground.r,
-                                        style.foreground.g,
-                                        style.foreground.b,
-                                    );
-                                    Span::styled(text.to_string(), Style::default().fg(fg_color))
-                                })
-                                .collect();
+        for line_index in start..end {
+            let line = lines[line_index];
+            let line_number = line_index + 1;
+            let line_num_str = format!("{:>width$} │ ", line_number, width = line_number_width);
 
-                            spans.extend(content_spans);
-                            Line::from(spans)
+            if is_semantic_search {
+                match highlighter.highlight_line(line, &syntax_set) {
+                    Ok(ranges) => {
+                        let mut spans: Vec<Span> = vec![Span::styled(
+                            line_num_str.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        )];
+
+                        for (style, text) in ranges.iter() {
+                            let fg_color = Color::Rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            );
+                            spans.push(Span::styled(
+                                text.to_string(),
+                                Style::default().fg(fg_color),
+                            ));
                         }
-                        Err(_) => {
-                            let spans = vec![
-                                Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
-                                Span::styled(line.to_string(), Style::default()),
-                            ];
-                            Line::from(spans)
+
+                        result.push(Line::from(spans));
+                    }
+                    Err(_) => {
+                        let spans = vec![
+                            Span::styled(
+                                line_num_str.clone(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(line.to_string(), Style::default()),
+                        ];
+                        result.push(Line::from(spans));
+                    }
+                }
+            } else {
+                match highlighter.highlight_line(line, &syntax_set) {
+                    Ok(ranges) => {
+                        let mut spans: Vec<Span> = vec![Span::styled(
+                            line_num_str.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        )];
+
+                        for (style, text) in ranges.iter() {
+                            let fg_color = Color::Rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            );
+                            spans.push(Span::styled(
+                                text.to_string(),
+                                Style::default().fg(fg_color),
+                            ));
+                        }
+
+                        if !search_terms.is_empty() {
+                            let line_num_span = spans[0].clone();
+                            let content_spans = spans[1..].to_vec();
+                            let highlighted_content =
+                                Self::highlight_search_terms(content_spans, &search_terms);
+                            let mut final_spans = vec![line_num_span];
+                            final_spans.extend(highlighted_content);
+                            result.push(Line::from(final_spans));
+                        } else {
+                            result.push(Line::from(spans));
                         }
                     }
-                } else {
-                    match highlighter.highlight_line(line, &SYNTAX_SET) {
-                        Ok(ranges) => {
-                            let mut spans: Vec<Span> = vec![Span::styled(
-                                line_num_str,
+                    Err(_) => {
+                        let spans = vec![
+                            Span::styled(
+                                line_num_str.clone(),
                                 Style::default().fg(Color::DarkGray),
-                            )];
+                            ),
+                            Span::styled(line.to_string(), Style::default()),
+                        ];
 
-                            let content_spans: Vec<Span> = ranges
-                                .iter()
-                                .map(|(style, text)| {
-                                    let fg_color = Color::Rgb(
-                                        style.foreground.r,
-                                        style.foreground.g,
-                                        style.foreground.b,
-                                    );
-                                    Span::styled(text.to_string(), Style::default().fg(fg_color))
-                                })
-                                .collect();
-
-                            spans.extend(content_spans);
-
-                            if !search_terms.is_empty() {
-                                let (line_num_span, content_spans) = spans.split_first().unwrap();
-                                let highlighted_content = Self::highlight_search_terms(
-                                    content_spans.to_vec(),
-                                    &search_terms,
-                                );
-                                let mut final_spans = vec![line_num_span.clone()];
-                                final_spans.extend(highlighted_content);
-                                Line::from(final_spans)
-                            } else {
-                                Line::from(spans)
-                            }
-                        }
-                        Err(_) => {
-                            let spans = vec![
-                                Span::styled(line_num_str, Style::default().fg(Color::DarkGray)),
-                                Span::styled(line.to_string(), Style::default()),
-                            ];
-
-                            if !search_terms.is_empty() {
-                                let (line_num_span, content_spans) = spans.split_first().unwrap();
-                                let highlighted_content = Self::highlight_search_terms(
-                                    content_spans.to_vec(),
-                                    &search_terms,
-                                );
-                                let mut final_spans = vec![line_num_span.clone()];
-                                final_spans.extend(highlighted_content);
-                                Line::from(final_spans)
-                            } else {
-                                Line::from(spans)
-                            }
+                        if !search_terms.is_empty() {
+                            let line_num_span = spans[0].clone();
+                            let content_spans = spans[1..].to_vec();
+                            let highlighted_content =
+                                Self::highlight_search_terms(content_spans, &search_terms);
+                            let mut final_spans = vec![line_num_span];
+                            final_spans.extend(highlighted_content);
+                            result.push(Line::from(final_spans));
+                        } else {
+                            result.push(Line::from(spans));
                         }
                     }
                 }
-            })
-            .collect();
+            }
+        }
 
         result
     }
 
     fn render_search_input(f: &mut Frame, area: Rect, engine: &Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::SearchInput);
+        let is_focused = matches!(engine.ui_mode, UIMode::SearchInput);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
         let mut title = " Search ".to_string();
@@ -461,7 +448,7 @@ impl UI {
             title = format!(" Search - {} ", error);
         } else if !engine.search_results.is_empty()
             && !engine.search_input.value().trim().is_empty()
-            && matches!(engine.focused_window, FocusedWindow::SearchInput)
+            && matches!(engine.ui_mode, UIMode::SearchInput)
         {
             title = format!(" Search - {} results ", engine.search_results.len());
         }
@@ -497,8 +484,6 @@ impl UI {
         state: &AppStateEnum,
         spinner_frame: usize,
         search_input: &str,
-        crawling_stats: &Option<(usize, f64)>,
-        processing_stats: &Option<(usize, f64)>,
     ) -> (String, &'static str) {
         match state {
             AppStateEnum::Crawling => {
@@ -517,26 +502,10 @@ impl UI {
             }
             AppStateEnum::Ready => {
                 if search_input.is_empty() {
-                    let title = match (crawling_stats, processing_stats) {
-                        (Some((files, duration)), Some((chunks, proc_dur))) => {
-                            format!(
-                                " Crawled {} files in {:.1}s - Processed {} chunks in {:.1}s ",
-                                files, duration, chunks, proc_dur
-                            )
-                        }
-                        (Some((files, duration)), None) => {
-                            format!(" Crawled {} files in {:.1}s ", files, duration)
-                        }
-                        _ => " Ready to Search ".to_string(),
-                    };
-
-                    let message = if crawling_stats.is_some() {
-                        "Processing completed! Semantic search ready.\nType your search query and press Enter to search."
-                    } else {
-                        "Type your search query and press Enter\nto search through indexed files."
-                    };
-
-                    (title, message)
+                    (
+                        " Ready to Search ".to_string(),
+                        "Type your search query and press Enter\nto search through indexed files.",
+                    )
                 } else {
                     (
                         " Ready to Search ".to_string(),
@@ -580,13 +549,20 @@ impl UI {
 
             let mut merged = Vec::new();
             for (start, end) in matches {
-                if let Some(&mut (_, ref mut last_end)) = merged.last_mut() {
+                let should_merge = if let Some((_, last_end)) = merged.last_mut() {
                     if start <= *last_end {
                         *last_end = end.max(*last_end);
-                        continue;
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+
+                if !should_merge {
+                    merged.push((start, end));
                 }
-                merged.push((start, end));
             }
 
             let mut pos = 0;

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use blake3::Hasher;
 use std::path::{Path, PathBuf};
 
 use crate::types::Chunk;
@@ -11,32 +10,25 @@ const MIN_CHUNK_SIZE: usize = 50;
 pub struct FileProcessor;
 
 impl FileProcessor {
-    pub async fn process_files(files: Vec<PathBuf>) -> Result<Vec<Chunk>> {
-        let mut all_chunks = Vec::new();
+    pub fn process_files(files: Vec<PathBuf>) -> Result<Vec<Chunk>> {
+        use rayon::prelude::*;
 
-        for file_path in files {
-            if let Ok(chunks) = Self::process_file(&file_path).await {
-                all_chunks.extend(chunks);
-            }
-        }
+        let all_chunks: Vec<Chunk> = files
+            .par_iter()
+            .filter_map(|file_path| Self::process_file_sync(file_path).ok())
+            .flatten()
+            .collect();
 
         Ok(all_chunks)
     }
 
-    async fn process_file(file_path: &Path) -> Result<Vec<Chunk>> {
-        let content = tokio::fs::read_to_string(file_path).await?;
-        let file_hash = Self::hash_content(&content);
-        let chunks = Self::create_chunks(file_path, &content, &file_hash);
+    fn process_file_sync(file_path: &Path) -> Result<Vec<Chunk>> {
+        let content = std::fs::read_to_string(file_path)?;
+        let chunks = Self::create_chunks(file_path, &content);
         Ok(chunks)
     }
 
-    fn hash_content(content: &str) -> String {
-        let mut hasher = Hasher::new();
-        hasher.update(content.as_bytes());
-        hasher.finalize().to_hex().to_string()
-    }
-
-    fn create_chunks(file_path: &Path, content: &str, file_hash: &str) -> Vec<Chunk> {
+    fn create_chunks(file_path: &Path, content: &str) -> Vec<Chunk> {
         let mut chunks = Vec::new();
 
         if content.len() < MIN_CHUNK_SIZE {
@@ -67,7 +59,7 @@ impl FileProcessor {
                 let end_line = start_line + chunk_content.matches('\n').count();
 
                 chunks.push(Chunk {
-                    id: format!("{}:{}", file_hash, chunk_id),
+                    id: format!("{}:{}", file_path.to_string_lossy(), chunk_id),
                     file_path: file_path.to_owned(),
                     start_line,
                     end_line,

@@ -46,9 +46,9 @@ impl VectorStore {
         }
 
         let outputs = self.session.run(inputs![
-            "input_ids" => TensorRef::from_array_view(input_ids_array.view())?,
-            "attention_mask" => TensorRef::from_array_view(attention_mask_array.view())?,
-            "token_type_ids" => TensorRef::from_array_view(token_type_ids_array.view())?,
+            "input_ids" => TensorRef::from_array_view(&input_ids_array)?,
+            "attention_mask" => TensorRef::from_array_view(&attention_mask_array)?,
+            "token_type_ids" => TensorRef::from_array_view(&token_type_ids_array)?,
         ])?;
 
         let output_array = outputs[0].try_extract_array::<f32>()?;
@@ -62,7 +62,7 @@ fn mean_pool(token_embeddings: ndarray::ArrayViewD<f32>, attention_mask: &[f32])
     let shape = token_embeddings.shape();
     let seq_len = shape[1];
     let hidden_size = shape[2];
-    
+
     let mut pooled = vec![0.0; hidden_size];
     let mut mask_sum = 0.0;
 

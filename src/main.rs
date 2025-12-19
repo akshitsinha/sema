@@ -62,7 +62,10 @@ fn resolve_directory(cli: &Cli) -> Result<PathBuf> {
     let target_directory = if let Some(dir) = &cli.directory {
         dir.clone()
     } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        match env::current_dir() {
+            Ok(path) => path,
+            Err(_) => PathBuf::from("."),
+        }
     };
 
     let canonical_path = target_directory.canonicalize().map_err(|_| {
