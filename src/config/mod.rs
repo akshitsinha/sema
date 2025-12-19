@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -170,9 +170,5 @@ impl ConfigManager {
             .with_context(|| format!("Failed to write config file: {:?}", self.config_file))?;
 
         Ok(())
-    }
-
-    pub fn config_file_path(&self) -> &Path {
-        &self.config_file
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use blake3::Hasher;
+use futures::future::join_all;
 use std::path::{Path, PathBuf};
 
 use crate::types::Chunk;
@@ -12,31 +12,28 @@ pub struct FileProcessor;
 
 impl FileProcessor {
     pub async fn process_files(files: Vec<PathBuf>) -> Result<Vec<Chunk>> {
-        let mut all_chunks = Vec::new();
+        let tasks: Vec<_> = files
+            .into_iter()
+            .map(|file_path| tokio::spawn(async move { Self::process_file(&file_path).await }))
+            .collect();
 
-        for file_path in files {
-            if let Ok(chunks) = Self::process_file(&file_path).await {
-                all_chunks.extend(chunks);
-            }
-        }
+        let chunks = join_all(tasks)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok().and_then(|r| r.ok()))
+            .flatten()
+            .collect();
 
-        Ok(all_chunks)
+        Ok(chunks)
     }
 
     async fn process_file(file_path: &Path) -> Result<Vec<Chunk>> {
         let content = tokio::fs::read_to_string(file_path).await?;
-        let file_hash = Self::hash_content(&content);
-        let chunks = Self::create_chunks(file_path, &content, &file_hash);
+        let chunks = Self::create_chunks(file_path, &content);
         Ok(chunks)
     }
 
-    fn hash_content(content: &str) -> String {
-        let mut hasher = Hasher::new();
-        hasher.update(content.as_bytes());
-        hasher.finalize().to_hex().to_string()
-    }
-
-    fn create_chunks(file_path: &Path, content: &str, file_hash: &str) -> Vec<Chunk> {
+    fn create_chunks(file_path: &Path, content: &str) -> Vec<Chunk> {
         let mut chunks = Vec::new();
 
         if content.len() < MIN_CHUNK_SIZE {
@@ -54,10 +51,10 @@ impl FileProcessor {
                 safe_end -= 1;
             }
 
-            if safe_end < content.len() {
-                if let Some(newline_pos) = content[start..safe_end].rfind('\n') {
-                    safe_end = start + newline_pos + 1;
-                }
+            if safe_end < content.len()
+                && let Some(newline_pos) = content[start..safe_end].rfind('\n')
+            {
+                safe_end = start + newline_pos + 1;
             }
 
             let chunk_content = &content[start..safe_end];
@@ -67,7 +64,7 @@ impl FileProcessor {
                 let end_line = start_line + chunk_content.matches('\n').count();
 
                 chunks.push(Chunk {
-                    id: format!("{}:{}", file_hash, chunk_id),
+                    id: format!("{}:{}", file_path.to_string_lossy(), chunk_id),
                     file_path: file_path.to_owned(),
                     start_line,
                     end_line,

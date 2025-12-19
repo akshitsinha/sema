@@ -13,7 +13,6 @@ use crate::types::{Chunk, FileIndex};
 
 pub struct LanceIndexer {
     connection: lancedb::Connection,
-    vector_store: VectorStore,
 }
 
 impl LanceIndexer {
@@ -25,12 +24,7 @@ impl LanceIndexer {
             .execute()
             .await?;
 
-        let vector_store = VectorStore::new()?;
-
-        Ok(Self {
-            connection,
-            vector_store,
-        })
+        Ok(Self { connection })
     }
 
     pub async fn index_chunks(&mut self, chunks: &[Chunk]) -> Result<()> {
@@ -60,17 +54,26 @@ impl LanceIndexer {
         let end_lines: Vec<u64> = chunks.iter().map(|c| c.end_line as u64).collect();
         let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
-        let mut vectors = Vec::new();
-        for chunk in chunks {
-            match self.vector_store.generate_embedding(&chunk.content) {
-                Ok(embedding) => {
-                    let vec_opt: Vec<Option<f32>> = embedding.into_iter().map(Some).collect();
-                    vectors.push(Some(vec_opt));
-                }
-                Err(_) => vectors.push(None),
-            }
-        }
+        let chunks_for_embedding: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
+        let vectors = tokio::task::spawn_blocking(move || {
+            let mut vector_store = VectorStore::new().ok()?;
+            let mut vecs = Vec::new();
+
+            for content in chunks_for_embedding {
+                match vector_store.generate_embedding(&content) {
+                    Ok(embedding) => {
+                        let vec_opt: Vec<Option<f32>> = embedding.into_iter().map(Some).collect();
+                        vecs.push(Some(vec_opt));
+                    }
+                    Err(_) => vecs.push(None),
+                }
+            }
+            Some(vecs)
+        })
+        .await?;
+
+        let vectors = vectors.ok_or_else(|| anyhow::anyhow!("Failed to generate embeddings"))?;
         let vector_array =
             FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 384);
 
@@ -109,7 +112,14 @@ impl LanceIndexer {
             Err(_) => return Ok(Vec::new()),
         };
 
-        if let Ok(query_embedding) = self.vector_store.generate_embedding(query) {
+        let query_str = query.to_string();
+        let query_embedding = tokio::task::spawn_blocking(move || {
+            let mut vector_store = VectorStore::new().ok()?;
+            vector_store.generate_embedding(&query_str).ok()
+        })
+        .await?;
+
+        if let Some(query_embedding) = query_embedding {
             let results = table
                 .query()
                 .nearest_to(query_embedding)?
@@ -170,10 +180,10 @@ impl LanceIndexer {
 
         let batches: Vec<_> = results.try_collect().await?;
         for batch in batches {
-            if batch.num_rows() > 0 {
-                if let Some(file_index) = self.extract_file_index_from_batch(&batch, 0) {
-                    return Ok(Some(file_index));
-                }
+            if batch.num_rows() > 0
+                && let Some(file_index) = self.extract_file_index_from_batch(&batch, 0)
+            {
+                return Ok(Some(file_index));
             }
         }
 

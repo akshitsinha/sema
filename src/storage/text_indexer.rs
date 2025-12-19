@@ -88,7 +88,7 @@ impl TextIndexer {
 
             let id = doc
                 .get_first(self.id_field)
-                .map(|v| OwnedValue::from(v))
+                .map(OwnedValue::from)
                 .and_then(|v| {
                     if let OwnedValue::Str(s) = v {
                         Some(s)
@@ -99,7 +99,7 @@ impl TextIndexer {
                 .unwrap_or_default();
             let path_str = doc
                 .get_first(self.path_field)
-                .map(|v| OwnedValue::from(v))
+                .map(OwnedValue::from)
                 .and_then(|v| {
                     if let OwnedValue::Str(s) = v {
                         Some(s)
@@ -110,7 +110,7 @@ impl TextIndexer {
                 .unwrap_or_default();
             let content = doc
                 .get_first(self.content_field)
-                .map(|v| OwnedValue::from(v))
+                .map(OwnedValue::from)
                 .and_then(|v| {
                     if let OwnedValue::Str(s) = v {
                         Some(s)
@@ -121,7 +121,7 @@ impl TextIndexer {
                 .unwrap_or_default();
             let start_line = doc
                 .get_first(self.start_line_field)
-                .map(|v| OwnedValue::from(v))
+                .map(OwnedValue::from)
                 .and_then(|v| {
                     if let OwnedValue::U64(n) = v {
                         Some(n)
@@ -132,7 +132,7 @@ impl TextIndexer {
                 .unwrap_or(0) as usize;
             let end_line = doc
                 .get_first(self.end_line_field)
-                .map(|v| OwnedValue::from(v))
+                .map(OwnedValue::from)
                 .and_then(|v| {
                     if let OwnedValue::U64(n) = v {
                         Some(n)

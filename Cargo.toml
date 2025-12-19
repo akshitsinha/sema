@@ -17,24 +17,18 @@ parking_lot = "0.12.4"
 
 # File system operations
 walkdir = "2.5.0"
-mime_guess = "2.0.5"
-mime = "0.3.17"
 ignore = "0.4.23"
-sha2 = "0.10.9"
 num_cpus = "1.17.0"
 
 # Text processing
 regex = "1.11.1"
 unicode-segmentation = "1.12.0"
 
-# Database
-bincode = "2.0.1"
-
 # Full text search
 tantivy = "0.25.0"
 
 # Fast hashing
-blake3 = "1.8.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Syntax highlighting for file previews
 syntect = "5.2.0"
@@ -57,7 +51,7 @@ rayon = "1.11.0"
 
 # Semantic search
 ort = "2.0.0-rc.10"
-lancedb = "0.22.3"
+lancedb = "0.23.0"
 arrow = "56.2.0"
 arrow-array = "56.2.0"
 arrow-schema = "56.2.0"

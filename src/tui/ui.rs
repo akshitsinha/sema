@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
 use super::engine::Engine;
-use crate::types::{AppState as AppStateEnum, FocusedWindow, UIMode};
+use crate::types::{AppState as AppStateEnum, UIMode};
 
 const LAYOUT_SPLIT_PERCENTAGE: u16 = 30;
 
@@ -24,7 +24,7 @@ impl UI {
         let background = Block::default().style(Style::default().bg(Color::Reset));
         f.render_widget(background, area);
 
-        match engine.app_state.state {
+        match engine.state {
             AppStateEnum::Crawling | AppStateEnum::Chunking | AppStateEnum::Ready => {
                 Self::render_main_interface(f, area, engine);
             }
@@ -32,9 +32,7 @@ impl UI {
     }
 
     fn render_main_interface(f: &mut Frame, area: Rect, engine: &mut Engine) {
-        if !engine.search_results.is_empty()
-            && matches!(engine.app_state.state, AppStateEnum::Ready)
-        {
+        if !engine.search_results.is_empty() && matches!(engine.state, AppStateEnum::Ready) {
             Self::render_search_interface(f, area, engine);
         } else {
             Self::render_status_screen(f, area, engine);
@@ -59,11 +57,9 @@ impl UI {
             .split(area);
 
         let (title, message) = Self::get_status_message(
-            &engine.app_state.state,
+            &engine.state,
             engine.spinner_frame,
             engine.search_input.value(),
-            &engine.crawling_stats,
-            &engine.processing_stats,
         );
 
         let status_block = Block::default()
@@ -116,23 +112,10 @@ impl UI {
     }
 
     fn render_search_results(f: &mut Frame, area: Rect, engine: &mut Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::SearchResults);
+        let is_focused = matches!(engine.ui_mode, UIMode::SearchResults);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
-        let mut title = format!(" Search Results ({}) ", engine.search_results.len());
-        if !engine.timing_shown {
-            if let (Some((_, crawl_time)), Some((_, process_time))) =
-                (&engine.crawling_stats, &engine.processing_stats)
-            {
-                let total_time = crawl_time + process_time;
-                title = format!(
-                    " Search Results ({}) - Indexed in {:.2}s ",
-                    engine.search_results.len(),
-                    total_time
-                );
-                engine.timing_shown = true;
-            }
-        }
+        let title = format!(" Search Results ({}) ", engine.search_results.len());
 
         let results_block = Block::default()
             .borders(Borders::ALL)
@@ -232,7 +215,7 @@ impl UI {
     }
 
     fn render_file_preview(f: &mut Frame, area: Rect, engine: &Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::FilePreview);
+        let is_focused = matches!(engine.ui_mode, UIMode::FilePreview);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
         if let Some(selected_result) = engine.search_results.get(engine.selected_search_result) {
@@ -453,7 +436,7 @@ impl UI {
     }
 
     fn render_search_input(f: &mut Frame, area: Rect, engine: &Engine) {
-        let is_focused = matches!(engine.focused_window, FocusedWindow::SearchInput);
+        let is_focused = matches!(engine.ui_mode, UIMode::SearchInput);
         let border_color = if is_focused { Color::Red } else { Color::Black };
 
         let mut title = " Search ".to_string();
@@ -461,7 +444,7 @@ impl UI {
             title = format!(" Search - {} ", error);
         } else if !engine.search_results.is_empty()
             && !engine.search_input.value().trim().is_empty()
-            && matches!(engine.focused_window, FocusedWindow::SearchInput)
+            && matches!(engine.ui_mode, UIMode::SearchInput)
         {
             title = format!(" Search - {} results ", engine.search_results.len());
         }
@@ -497,8 +480,6 @@ impl UI {
         state: &AppStateEnum,
         spinner_frame: usize,
         search_input: &str,
-        crawling_stats: &Option<(usize, f64)>,
-        processing_stats: &Option<(usize, f64)>,
     ) -> (String, &'static str) {
         match state {
             AppStateEnum::Crawling => {
@@ -517,26 +498,10 @@ impl UI {
             }
             AppStateEnum::Ready => {
                 if search_input.is_empty() {
-                    let title = match (crawling_stats, processing_stats) {
-                        (Some((files, duration)), Some((chunks, proc_dur))) => {
-                            format!(
-                                " Crawled {} files in {:.1}s - Processed {} chunks in {:.1}s ",
-                                files, duration, chunks, proc_dur
-                            )
-                        }
-                        (Some((files, duration)), None) => {
-                            format!(" Crawled {} files in {:.1}s ", files, duration)
-                        }
-                        _ => " Ready to Search ".to_string(),
-                    };
-
-                    let message = if crawling_stats.is_some() {
-                        "Processing completed! Semantic search ready.\nType your search query and press Enter to search."
-                    } else {
-                        "Type your search query and press Enter\nto search through indexed files."
-                    };
-
-                    (title, message)
+                    (
+                        " Ready to Search ".to_string(),
+                        "Type your search query and press Enter\nto search through indexed files.",
+                    )
                 } else {
                     (
                         " Ready to Search ".to_string(),
@@ -580,11 +545,11 @@ impl UI {
 
             let mut merged = Vec::new();
             for (start, end) in matches {
-                if let Some(&mut (_, ref mut last_end)) = merged.last_mut() {
-                    if start <= *last_end {
-                        *last_end = end.max(*last_end);
-                        continue;
-                    }
+                if let Some(&mut (_, ref mut last_end)) = merged.last_mut()
+                    && start <= *last_end
+                {
+                    *last_end = end.max(*last_end);
+                    continue;
                 }
                 merged.push((start, end));
             }

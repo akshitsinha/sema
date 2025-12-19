@@ -62,7 +62,7 @@ fn mean_pool(token_embeddings: ndarray::ArrayViewD<f32>, attention_mask: &[f32])
     let shape = token_embeddings.shape();
     let seq_len = shape[1];
     let hidden_size = shape[2];
-    
+
     let mut pooled = vec![0.0; hidden_size];
     let mut mask_sum = 0.0;
 
