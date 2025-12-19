@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::types::FocusedWindow;
+use crate::crawler::FileCrawler;
+use crate::storage::StorageManager;
 
-use super::engine::{Engine, StateUpdate};
+use super::engine::Engine;
 use super::events::{EventHandler, EventResult};
 use super::ui::UI;
 
@@ -25,22 +26,13 @@ const SPINNER_UPDATE_INTERVAL_MS: u64 = 100;
 
 pub struct App {
     engine: Engine,
-    state_rx: mpsc::UnboundedReceiver<StateUpdate>,
-    state_tx: mpsc::UnboundedSender<StateUpdate>,
-    crawler_handle: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl App {
     pub fn new_with_directory(directory: PathBuf, config: Config) -> Result<Self> {
-        let (state_tx, state_rx) = mpsc::unbounded_channel();
         let engine = Engine::new(directory, config);
 
-        Ok(Self {
-            engine,
-            state_rx,
-            state_tx,
-            crawler_handle: None,
-        })
+        Ok(Self { engine })
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -50,8 +42,7 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        self.start_crawler().await?;
-        let result = self.run_main_loop(&mut terminal).await;
+        let result = self.start(&mut terminal).await;
 
         disable_raw_mode()?;
         execute!(
@@ -64,44 +55,83 @@ impl App {
         result
     }
 
-    async fn start_crawler(&mut self) -> Result<()> {
-        let handle = self.engine.start_crawler(self.state_tx.clone()).await?;
-        self.crawler_handle = Some(handle);
-        Ok(())
-    }
-
-    async fn run_main_loop<B: ratatui::backend::Backend>(
+    async fn start<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
+        let config_dir = Self::config_dir();
+
+        self.engine.state = crate::types::AppState::Crawling;
+        terminal.draw(|f| UI::render(f, &mut self.engine))?;
+
+        let state_rx = self.init_background(config_dir.clone());
+        self.event_loop(terminal, state_rx, config_dir).await
+    }
+
+    fn config_dir() -> PathBuf {
+        dirs::config_dir()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sema")
+    }
+
+    fn init_background(&self, config_dir: PathBuf) -> mpsc::Receiver<crate::types::AppState> {
+        let (state_tx, state_rx) = mpsc::channel(10);
+        let root_path = self.engine.root_path.clone();
+        let crawler_config = self.engine.crawler_config.clone();
+
+        tokio::spawn(async move {
+            let _ = Self::initialize(root_path, crawler_config, config_dir, state_tx).await;
+        });
+
+        state_rx
+    }
+
+    async fn initialize(
+        root_path: PathBuf,
+        crawler_config: crate::types::CrawlerConfig,
+        config_dir: PathBuf,
+        state_tx: mpsc::Sender<crate::types::AppState>,
+    ) -> Result<()> {
+        let crawler = FileCrawler::new(crawler_config);
+        let files = crawler.crawl_directory(&root_path).await?;
+
+        state_tx.send(crate::types::AppState::Chunking).await?;
+
+        let mut service = StorageManager::new(&config_dir).await?;
+        service.process_and_index_files(files).await?;
+
+        state_tx.send(crate::types::AppState::Ready).await?;
+        Ok(())
+    }
+
+    async fn event_loop<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        mut state_rx: mpsc::Receiver<crate::types::AppState>,
+        config_dir: PathBuf,
+    ) -> Result<()> {
         let mut last_tick = Instant::now();
-        let mut needs_redraw = true;
 
         loop {
-            self.process_state_updates().await;
+            while let Ok(new_state) = state_rx.try_recv() {
+                self.engine.state = new_state.clone();
 
-            if self.engine.data_changed {
-                needs_redraw = true;
-                self.engine.data_changed = false;
-            }
-
-            if needs_redraw {
-                terminal.draw(|f| UI::render(f, &mut self.engine))?;
-                needs_redraw = false;
-            }
-
-            if ratatui::crossterm::event::poll(Duration::from_millis(POLL_INTERVAL_MS))? {
-                if let Ok(event) = event::read() {
-                    let terminal_size = terminal.size()?;
-                    needs_redraw = self.handle_event(event, terminal_size.height).await;
+                if matches!(new_state, crate::types::AppState::Ready) {
+                    self.engine.processing_service = StorageManager::new(&config_dir).await.ok();
                 }
             }
 
-            if self.should_update_spinner()
-                && last_tick.elapsed() >= Duration::from_millis(SPINNER_UPDATE_INTERVAL_MS)
+            if ratatui::crossterm::event::poll(Duration::from_millis(POLL_INTERVAL_MS))?
+                && let Ok(event) = event::read()
             {
+                let terminal_size = terminal.size()?;
+                let _ = self.handle_event(event, terminal_size.height).await;
+            }
+
+            if last_tick.elapsed() >= Duration::from_millis(SPINNER_UPDATE_INTERVAL_MS) {
                 self.engine.spinner_frame = (self.engine.spinner_frame + 1) % 8;
-                needs_redraw = true;
+                terminal.draw(|f| UI::render(f, &mut self.engine))?;
                 last_tick = Instant::now();
             }
 
@@ -110,38 +140,7 @@ impl App {
             }
         }
 
-        if let Some(handle) = self.crawler_handle.take() {
-            handle.abort();
-        }
-
         Ok(())
-    }
-
-    async fn process_state_updates(&mut self) {
-        while let Ok(update) = self.state_rx.try_recv() {
-            self.engine.data_changed = true;
-            
-            match update {
-                StateUpdate::FileFound(file) => {
-                    self.engine.app_state.crawled_files.push(file);
-                }
-                StateUpdate::StateChanged(new_state) => {
-                    self.engine.app_state.state = new_state;
-                }
-                StateUpdate::AllFilesCollected(files) => {
-                    let state_tx = self.state_tx.clone();
-                    tokio::spawn(async move {
-                        Engine::start_chunking(state_tx, files).await;
-                    });
-                }
-                StateUpdate::CrawlingCompleted { files_count, duration_secs } => {
-                    self.engine.crawling_stats = Some((files_count, duration_secs));
-                }
-                StateUpdate::ProcessingCompleted { chunks_count, duration_secs } => {
-                    self.engine.processing_stats = Some((chunks_count, duration_secs));
-                }
-            }
-        }
     }
 
     async fn handle_event(&mut self, event: Event, terminal_height: u16) -> bool {
@@ -150,8 +149,11 @@ impl App {
                 self.engine.search_error = None;
                 let prev_selected = self.engine.selected_search_result;
 
-                let result = if matches!(self.engine.app_state.state, crate::types::AppState::Ready) {
-                    let current_result = self.engine.search_results.get(self.engine.selected_search_result);
+                let result = if matches!(self.engine.state, crate::types::AppState::Ready) {
+                    let current_result = self
+                        .engine
+                        .search_results
+                        .get(self.engine.selected_search_result);
                     EventHandler::handle_key_input(
                         &key,
                         &mut self.engine.search_input,
@@ -169,22 +171,66 @@ impl App {
                 };
 
                 match result {
-                    EventResult::ExecuteSearch(query) => self.execute_search(&query).await,
-                    EventResult::OpenFile => self.open_file().await,
+                    EventResult::ExecuteSearch(query) => {
+                        if query.trim().len() > 2 {
+                            if self.engine.execute_search(&query).await.is_ok() {
+                                if let Some(first) = self.engine.search_results.first().cloned() {
+                                    self.engine
+                                        .update_current_file_content(&first.chunk.file_path)
+                                        .await;
+                                    self.engine.file_preview_scroll_offset =
+                                        first.chunk.start_line.saturating_sub(1);
+                                }
+                            } else {
+                                self.engine.search_error = Some("Search failed".to_string());
+                                self.engine.clear_search();
+                            }
+                        } else {
+                            self.engine.clear_search();
+                        }
+                    }
+                    EventResult::OpenFile => {
+                        if let Some(result) = self
+                            .engine
+                            .search_results
+                            .get(self.engine.selected_search_result)
+                            .cloned()
+                        {
+                            self.engine
+                                .update_current_file_content(&result.chunk.file_path)
+                                .await;
+                            self.engine.file_preview_scroll_offset =
+                                result.chunk.start_line.saturating_sub(1);
+                        }
+                        self.engine.ui_mode = crate::types::UIMode::FilePreview;
+                    }
                     EventResult::Quit => self.engine.should_quit = true,
                     EventResult::Continue => {}
                 }
 
                 if self.engine.selected_search_result != prev_selected {
-                    self.sync_file_preview().await;
+                    if let Some(result) = self
+                        .engine
+                        .search_results
+                        .get(self.engine.selected_search_result)
+                        .cloned()
+                    {
+                        if self.engine.current_file_path.as_ref() != Some(&result.chunk.file_path) {
+                            self.engine
+                                .update_current_file_content(&result.chunk.file_path)
+                                .await;
+                        }
+                        self.engine.file_preview_scroll_offset =
+                            result.chunk.start_line.saturating_sub(1);
+                    }
                 }
 
-                self.engine.update_focused_window();
                 true
             }
-            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) => {
-                self.engine.focused_window = FocusedWindow::SearchInput;
-                if matches!(self.engine.app_state.state, crate::types::AppState::Ready)
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                if matches!(self.engine.state, crate::types::AppState::Ready)
                     && !self.engine.search_results.is_empty()
                 {
                     self.engine.ui_mode = crate::types::UIMode::SearchInput;
@@ -193,56 +239,5 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    async fn execute_search(&mut self, query: &str) {
-        if query.trim().len() <= 2 {
-            self.engine.clear_search();
-            return;
-        }
-
-        if self.engine.execute_search(query).await.is_err() {
-            self.engine.search_error = Some("Search failed".to_string());
-            self.engine.clear_search();
-            return;
-        }
-
-        if let Some(first) = self.engine.search_results.first().cloned() {
-            self.engine.update_current_file_content(&first.chunk.file_path).await;
-            self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&first);
-        }
-    }
-
-    async fn open_file(&mut self) {
-        let Some(result) = self.engine.search_results.get(self.engine.selected_search_result).cloned() else {
-            self.engine.ui_mode = crate::types::UIMode::FilePreview;
-            self.engine.update_focused_window();
-            return;
-        };
-
-        self.engine.update_current_file_content(&result.chunk.file_path).await;
-        self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&result);
-        self.engine.ui_mode = crate::types::UIMode::FilePreview;
-        self.engine.update_focused_window();
-    }
-
-    async fn sync_file_preview(&mut self) {
-        let Some(result) = self.engine.search_results.get(self.engine.selected_search_result).cloned() else {
-            return;
-        };
-
-        let needs_load = self.engine.current_file_path.as_ref() != Some(&result.chunk.file_path);
-        if needs_load {
-            self.engine.update_current_file_content(&result.chunk.file_path).await;
-        }
-
-        self.engine.file_preview_scroll_offset = self.engine.calculate_search_result_line_offset(&result);
-    }
-
-    fn should_update_spinner(&self) -> bool {
-        matches!(
-            self.engine.app_state.state,
-            crate::types::AppState::Crawling | crate::types::AppState::Chunking
-        )
     }
 }

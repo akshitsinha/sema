@@ -43,22 +43,20 @@ impl EventHandler {
                     }
                 }
             },
-            KeyCode::Esc => {
-                match *ui_mode {
-                    UIMode::FilePreview => {
-                        *ui_mode = UIMode::SearchResults;
-                        EventResult::Continue
-                    }
-                    UIMode::SearchResults => {
-                        *ui_mode = UIMode::SearchInput;
-                        EventResult::Continue
-                    }
-                    UIMode::SearchInput => {
-                        search_input.reset();
-                        EventResult::ExecuteSearch(String::new())
-                    }
+            KeyCode::Esc => match *ui_mode {
+                UIMode::FilePreview => {
+                    *ui_mode = UIMode::SearchResults;
+                    EventResult::Continue
                 }
-            }
+                UIMode::SearchResults => {
+                    *ui_mode = UIMode::SearchInput;
+                    EventResult::Continue
+                }
+                UIMode::SearchInput => {
+                    search_input.reset();
+                    EventResult::ExecuteSearch(String::new())
+                }
+            },
             KeyCode::Tab => {
                 if search_results_len > 0 {
                     match *ui_mode {

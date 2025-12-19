@@ -3,292 +3,270 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::semantic::embeddings::VectorStore;
 use crate::types::{Chunk, FileIndex};
 
+const BATCH_SIZE: usize = 100;
+
+fn create_chunks_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("start_line", DataType::UInt64, false),
+        Field::new("end_line", DataType::UInt64, false),
+        Field::new("content", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
+            true,
+        ),
+    ]))
+}
+
+fn create_file_index_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("hash", DataType::Utf8, false),
+    ]))
+}
+
 pub struct LanceIndexer {
-    connection: lancedb::Connection,
-    vector_store: VectorStore,
+    conn: lancedb::Connection,
 }
 
 impl LanceIndexer {
     pub async fn new(data_dir: &Path) -> Result<Self> {
         let db_path = data_dir.join("lancedb_chunks");
         std::fs::create_dir_all(&db_path)?;
-
-        let connection = lancedb::connect(&db_path.to_string_lossy())
+        let conn = lancedb::connect(&db_path.to_string_lossy())
             .execute()
             .await?;
-
-        let vector_store = VectorStore::new()?;
-
-        Ok(Self {
-            connection,
-            vector_store,
-        })
+        Ok(Self { conn })
     }
 
     pub async fn index_chunks(&mut self, chunks: &[Chunk]) -> Result<()> {
+        for batch in chunks.chunks(BATCH_SIZE) {
+            self.index_batch(batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn index_batch(&mut self, chunks: &[Chunk]) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("file_path", DataType::Utf8, false),
-            Field::new("start_line", DataType::UInt64, false),
-            Field::new("end_line", DataType::UInt64, false),
-            Field::new("content", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
-                true,
-            ),
-        ]));
-
-        let ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
-        let file_paths: Vec<String> = chunks
+        let ids: Vec<_> = chunks.iter().map(|c| c.id.clone()).collect();
+        let paths: Vec<_> = chunks
             .iter()
-            .map(|c| c.file_path.to_string_lossy().to_string())
+            .map(|c| c.file_path.to_string_lossy().into_owned())
             .collect();
-        let start_lines: Vec<u64> = chunks.iter().map(|c| c.start_line as u64).collect();
-        let end_lines: Vec<u64> = chunks.iter().map(|c| c.end_line as u64).collect();
-        let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+        let starts: Vec<_> = chunks.iter().map(|c| c.start_line as u64).collect();
+        let ends: Vec<_> = chunks.iter().map(|c| c.end_line as u64).collect();
+        let contents: Vec<_> = chunks.iter().map(|c| c.content.clone()).collect();
 
-        let mut vectors = Vec::new();
-        for chunk in chunks {
-            match self.vector_store.generate_embedding(&chunk.content) {
-                Ok(embedding) => {
-                    let vec_opt: Vec<Option<f32>> = embedding.into_iter().map(Some).collect();
-                    vectors.push(Some(vec_opt));
-                }
-                Err(_) => vectors.push(None),
+        let vectors = tokio::task::spawn_blocking({
+            let contents = contents.clone();
+            move || -> Result<Vec<Option<Vec<Option<f32>>>>> {
+                use rayon::prelude::*;
+                Ok(contents
+                    .par_iter()
+                    .map(|content| {
+                        VectorStore::new()
+                            .ok()?
+                            .generate_embedding(content)
+                            .map(|e| e.into_iter().map(Some).collect())
+                            .ok()
+                    })
+                    .collect())
             }
-        }
+        })
+        .await??;
 
-        let vector_array =
-            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 384);
-
+        let schema = create_chunks_schema();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(file_paths)),
-                Arc::new(UInt64Array::from(start_lines)),
-                Arc::new(UInt64Array::from(end_lines)),
+                Arc::new(StringArray::from(paths)),
+                Arc::new(UInt64Array::from(starts)),
+                Arc::new(UInt64Array::from(ends)),
                 Arc::new(StringArray::from(contents)),
-                Arc::new(vector_array),
+                Arc::new(
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, 384),
+                ),
             ],
         )?;
 
-        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-
-        match self.connection.open_table("chunks").execute().await {
-            Ok(table) => {
-                table.add(Box::new(batches)).execute().await?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        match self.conn.open_table("chunks").execute().await {
+            Ok(t) => {
+                t.add(Box::new(batches)).execute().await?;
             }
             Err(_) => {
-                self.connection
+                self.conn
                     .create_table("chunks", Box::new(batches))
                     .execute()
                     .await?;
             }
         }
-
         Ok(())
     }
 
     pub async fn search(&mut self, query: &str, limit: usize) -> Result<Vec<Chunk>> {
-        let table = match self.connection.open_table("chunks").execute().await {
-            Ok(table) => table,
+        let table = match self.conn.open_table("chunks").execute().await {
+            Ok(t) => t,
             Err(_) => return Ok(Vec::new()),
         };
 
-        if let Ok(query_embedding) = self.vector_store.generate_embedding(query) {
-            let results = table
+        let query_str = query.to_string();
+        let embedding = tokio::task::spawn_blocking(move || {
+            VectorStore::new().ok()?.generate_embedding(&query_str).ok()
+        })
+        .await?;
+
+        let batches: Vec<RecordBatch> = if let Some(emb) = embedding {
+            table
                 .query()
-                .nearest_to(query_embedding)?
+                .nearest_to(emb)?
                 .limit(limit)
                 .execute()
-                .await?;
+                .await?
+                .try_collect()
+                .await?
+        } else {
+            let filter = format!("content LIKE '%{}%'", query.replace("'", "''"));
+            table
+                .query()
+                .only_if(filter)
+                .limit(limit)
+                .execute()
+                .await?
+                .try_collect()
+                .await?
+        };
 
-            let batches: Vec<_> = results.try_collect().await?;
-            let mut chunks = Vec::new();
-
-            for batch in batches {
-                let num_rows = batch.num_rows();
-                for i in 0..num_rows {
-                    if let Some(chunk) = self.extract_chunk_from_batch(&batch, i) {
-                        chunks.push(chunk);
-                    }
-                }
-            }
-
-            return Ok(chunks);
-        }
-
-        let results = table
-            .query()
-            .only_if(format!("content LIKE '%{}%'", query.replace("'", "''")))
-            .limit(limit)
-            .execute()
-            .await?;
-
-        let batches: Vec<_> = results.try_collect().await?;
-        let mut chunks = Vec::new();
-
-        for batch in batches {
-            let num_rows = batch.num_rows();
-            for i in 0..num_rows {
-                if let Some(chunk) = self.extract_chunk_from_batch(&batch, i) {
-                    chunks.push(chunk);
-                }
-            }
-        }
-
-        Ok(chunks)
+        Ok(batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).filter_map(|i| extract_chunk(b, i)))
+            .collect())
     }
 
     pub async fn get_file_index(&self, file_path: &Path) -> Result<Option<FileIndex>> {
-        let file_table = match self.connection.open_table("file_index").execute().await {
-            Ok(table) => table,
+        let table = match self.conn.open_table("file_index").execute().await {
+            Ok(t) => t,
             Err(_) => return Ok(None),
         };
 
-        let path_str = file_path.to_string_lossy();
-        let results = file_table
+        let filter = format!("file_path = {}", escape_sql(&file_path.to_string_lossy()));
+        let batches: Vec<_> = table
             .query()
-            .only_if(format!("file_path = '{}'", path_str.replace("'", "''")))
+            .only_if(filter)
             .limit(1)
             .execute()
+            .await?
+            .try_collect()
             .await?;
 
-        let batches: Vec<_> = results.try_collect().await?;
-        for batch in batches {
-            if batch.num_rows() > 0 {
-                if let Some(file_index) = self.extract_file_index_from_batch(&batch, 0) {
-                    return Ok(Some(file_index));
-                }
-            }
-        }
-
-        Ok(None)
+        Ok(batches.first().and_then(|b| extract_file_index(b, 0)))
     }
 
-    pub async fn update_file_index(&mut self, file_path: &Path, file_hash: &str) -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("file_path", DataType::Utf8, false),
-            Field::new("hash", DataType::Utf8, false),
-        ]));
+    pub async fn update_file_index(&mut self, file_path: &Path, hash: &str) -> Result<()> {
+        let path_str = file_path.to_string_lossy().into_owned();
+        let filter = format!("file_path = {}", escape_sql(&path_str));
 
-        let file_index = FileIndex {
-            file_path: file_path.to_owned(),
-            hash: file_hash.to_string(),
-        };
+        if let Ok(table) = self.conn.open_table("file_index").execute().await {
+            let _ = table.delete(&filter).await;
+        }
 
+        let schema = create_file_index_schema();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec![
-                    file_index.file_path.to_string_lossy().to_string(),
-                ])),
-                Arc::new(StringArray::from(vec![file_index.hash])),
+                Arc::new(StringArray::from(vec![path_str])),
+                Arc::new(StringArray::from(vec![hash.to_string()])),
             ],
         )?;
 
-        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
-
-        let path_str = file_path.to_string_lossy();
-        if let Ok(file_table) = self.connection.open_table("file_index").execute().await {
-            if (file_table
-                .delete(&format!("file_path = '{}'", path_str.replace("'", "''")))
-                .await)
-                .is_ok()
-            {
-                file_table.add(Box::new(batches)).execute().await?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        match self.conn.open_table("file_index").execute().await {
+            Ok(t) => {
+                t.add(Box::new(batches)).execute().await?;
             }
-        } else {
-            let _table = self
-                .connection
-                .create_table("file_index", Box::new(batches))
-                .execute()
-                .await?;
+            Err(_) => {
+                self.conn
+                    .create_table("file_index", Box::new(batches))
+                    .execute()
+                    .await?;
+            }
         }
-
         Ok(())
     }
 
     pub async fn remove_file_chunks(&mut self, file_path: &Path) -> Result<()> {
-        if let Ok(chunks_table) = self.connection.open_table("chunks").execute().await {
-            let path_str = file_path.to_string_lossy();
-            chunks_table
-                .delete(&format!("file_path = '{}'", path_str.replace("'", "''")))
-                .await?;
-        }
+        let filter = format!("file_path = {}", escape_sql(&file_path.to_string_lossy()));
 
-        if let Ok(file_table) = self.connection.open_table("file_index").execute().await {
-            let path_str = file_path.to_string_lossy();
-            file_table
-                .delete(&format!("file_path = '{}'", path_str.replace("'", "''")))
-                .await?;
+        if let Ok(t) = self.conn.open_table("chunks").execute().await {
+            t.delete(&filter).await?;
         }
-
+        if let Ok(t) = self.conn.open_table("file_index").execute().await {
+            t.delete(&filter).await?;
+        }
         Ok(())
     }
+}
 
-    fn extract_chunk_from_batch(&self, batch: &RecordBatch, row_index: usize) -> Option<Chunk> {
-        let id_col = batch
-            .column_by_name("id")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
-        let file_path_col = batch
-            .column_by_name("file_path")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
-        let start_line_col = batch
-            .column_by_name("start_line")?
-            .as_any()
-            .downcast_ref::<UInt64Array>()?;
-        let end_line_col = batch
-            .column_by_name("end_line")?
-            .as_any()
-            .downcast_ref::<UInt64Array>()?;
-        let content_col = batch
-            .column_by_name("content")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
+fn extract_chunk(batch: &RecordBatch, i: usize) -> Option<Chunk> {
+    let id_col = batch
+        .column_by_name("id")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let path_col = batch
+        .column_by_name("file_path")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let start_col = batch
+        .column_by_name("start_line")?
+        .as_any()
+        .downcast_ref::<UInt64Array>()?;
+    let end_col = batch
+        .column_by_name("end_line")?
+        .as_any()
+        .downcast_ref::<UInt64Array>()?;
+    let content_col = batch
+        .column_by_name("content")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
 
-        Some(Chunk {
-            id: id_col.value(row_index).to_string(),
-            file_path: std::path::PathBuf::from(file_path_col.value(row_index)),
-            start_line: start_line_col.value(row_index) as usize,
-            end_line: end_line_col.value(row_index) as usize,
-            content: content_col.value(row_index).to_string(),
-        })
-    }
+    Some(Chunk {
+        id: id_col.value(i).to_string(),
+        file_path: PathBuf::from(path_col.value(i)),
+        start_line: start_col.value(i) as usize,
+        end_line: end_col.value(i) as usize,
+        content: content_col.value(i).to_string(),
+    })
+}
 
-    fn extract_file_index_from_batch(
-        &self,
-        batch: &RecordBatch,
-        row_index: usize,
-    ) -> Option<FileIndex> {
-        let file_path_col = batch
-            .column_by_name("file_path")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
-        let hash_col = batch
-            .column_by_name("hash")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
+fn extract_file_index(batch: &RecordBatch, i: usize) -> Option<FileIndex> {
+    let path_col = batch
+        .column_by_name("file_path")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let hash_col = batch
+        .column_by_name("hash")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
 
-        Some(FileIndex {
-            file_path: std::path::PathBuf::from(file_path_col.value(row_index)),
-            hash: hash_col.value(row_index).to_string(),
-        })
-    }
+    Some(FileIndex {
+        file_path: PathBuf::from(path_col.value(i)),
+        hash: hash_col.value(i).to_string(),
+    })
+}
+
+fn escape_sql(s: &str) -> String {
+    format!("'{}'", s.replace("'", "''"))
 }

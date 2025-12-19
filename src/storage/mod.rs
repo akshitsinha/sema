@@ -31,25 +31,29 @@ impl StorageManager {
         let mut files_to_process = Vec::new();
 
         for file_path in &files {
-            if file_path.exists() {
-                let current_hash = Self::calculate_file_hash_from_path(file_path).await?;
+            if !file_path.exists() {
+                continue;
+            }
 
-                match self.lance_indexer.get_file_index(file_path).await? {
-                    Some(file_index) if file_index.hash == current_hash => {
-                        continue;
-                    }
-                    Some(_) => {
-                        self.lance_indexer.remove_file_chunks(file_path).await?;
-                        files_to_process.push(file_path.clone());
-                    }
-                    None => {
-                        files_to_process.push(file_path.clone());
-                    }
+            let current_hash = Self::calculate_file_hash_from_path(file_path).await?;
+
+            let needs_processing = match self.lance_indexer.get_file_index(file_path).await? {
+                Some(file_index) if file_index.hash == current_hash => false,
+                Some(_) => {
+                    self.lance_indexer.remove_file_chunks(file_path).await?;
+                    true
                 }
+                None => true,
+            };
+
+            if needs_processing {
+                files_to_process.push(file_path.clone());
             }
         }
 
-        let chunks = FileProcessor::process_files(files_to_process.clone()).await?;
+        let files_clone = files_to_process.clone();
+        let chunks = tokio::task::spawn_blocking(move || FileProcessor::process_files(files_clone))
+            .await??;
         let chunk_count = chunks.len();
 
         if !chunks.is_empty() {
@@ -67,14 +71,15 @@ impl StorageManager {
 
     async fn calculate_file_hash_from_path(file_path: &Path) -> Result<String> {
         let metadata = tokio::fs::metadata(file_path).await?;
-        let mut hasher = blake3::Hasher::new();
 
-        if metadata.len() <= 1024 * 1024 {
+        if metadata.len() <= 1_048_576 {
+            // 1MB
             let contents = tokio::fs::read(file_path).await?;
-            hasher.update(&contents);
+            Ok(format!("{:x}", xxhash_rust::xxh3::xxh3_128(&contents)))
         } else {
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
             let mut file = tokio::fs::File::open(file_path).await?;
-            let mut buffer = [0; 131072];
+            let mut buffer = [0; 131_072]; // 128KB
 
             loop {
                 let bytes_read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
@@ -83,9 +88,9 @@ impl StorageManager {
                 }
                 hasher.update(&buffer[..bytes_read]);
             }
-        }
 
-        Ok(hasher.finalize().to_hex().to_string())
+            Ok(format!("{:x}", hasher.digest128()))
+        }
     }
 
     pub async fn index_chunks(&mut self, chunks: &[Chunk]) -> Result<()> {

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
-use tokio::sync::mpsc;
 
 use crate::types::CrawlerConfig;
 
@@ -16,30 +15,26 @@ impl FileCrawler {
         Self { config }
     }
 
-    pub async fn crawl_directory(
-        &self,
-        root_path: &Path,
-        file_tx: mpsc::UnboundedSender<PathBuf>,
-    ) -> Result<()> {
+    pub async fn crawl_directory(&self, root_path: &Path) -> Result<Vec<PathBuf>> {
         let root_path = root_path.to_owned();
         let config = self.config.clone();
 
-        tokio::task::spawn_blocking(move || Self::crawl(root_path, config, file_tx))
+        tokio::task::spawn_blocking(move || Self::crawl(root_path, config))
             .await
             .context("Crawler task failed")?
     }
 
-    fn crawl(
-        root_path: PathBuf,
-        config: CrawlerConfig,
-        file_tx: mpsc::UnboundedSender<PathBuf>,
-    ) -> Result<()> {
+    fn crawl(root_path: PathBuf, config: CrawlerConfig) -> Result<Vec<PathBuf>> {
         let allowed_extensions: Option<HashSet<String>> = if !config.file_extensions.is_empty() {
             Some(
                 config
                     .file_extensions
                     .iter()
-                    .map(|ext| ext.trim_start_matches("*.").trim_start_matches('.').to_lowercase())
+                    .map(|ext| {
+                        ext.trim_start_matches("*.")
+                            .trim_start_matches('.')
+                            .to_lowercase()
+                    })
                     .collect(),
             )
         } else {
@@ -59,22 +54,20 @@ impl FileCrawler {
             walker.add_ignore(format!("!{}", pattern));
         }
 
-        walker.build_parallel().run(|| {
-            let file_tx = file_tx.clone();
-            let allowed_extensions = allowed_extensions.clone();
-            let max_size = config.max_file_size;
+        let walk_results = walker.build();
+        let mut files = Vec::new();
 
-            Box::new(move |entry| {
-                if let Ok(entry) = entry {
-                    if let Some(file_path) = Self::process_entry(&entry, &allowed_extensions, max_size) {
-                        let _ = file_tx.send(file_path);
-                    }
+        for entry_result in walk_results {
+            if let Ok(entry) = entry_result {
+                if let Some(file_path) =
+                    Self::process_entry(&entry, &allowed_extensions, config.max_file_size)
+                {
+                    files.push(file_path);
                 }
-                ignore::WalkState::Continue
-            })
-        });
+            }
+        }
 
-        Ok(())
+        Ok(files)
     }
 
     fn process_entry(
@@ -83,14 +76,24 @@ impl FileCrawler {
         max_size: u64,
     ) -> Option<PathBuf> {
         let path = entry.path();
-        let metadata = entry.metadata().ok()?;
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
 
         if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_size {
             return None;
         }
 
         if let Some(ext_set) = allowed_extensions {
-            let extension = path.extension()?.to_str()?.to_lowercase();
+            let extension_os = match path.extension() {
+                Some(ext) => ext,
+                None => return None,
+            };
+            let extension = match extension_os.to_str() {
+                Some(s) => s.to_lowercase(),
+                None => return None,
+            };
             if !ext_set.contains(&extension) {
                 return None;
             }

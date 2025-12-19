@@ -86,61 +86,60 @@ impl TextIndexer {
         for (score, doc_address) in top_docs {
             let doc = searcher.doc::<tantivy::TantivyDocument>(doc_address)?;
 
-            let id = doc
-                .get_first(self.id_field)
-                .map(|v| OwnedValue::from(v))
-                .and_then(|v| {
-                    if let OwnedValue::Str(s) = v {
-                        Some(s)
-                    } else {
-                        None
+            let id = match doc.get_first(self.id_field) {
+                Some(field_value) => {
+                    let value = OwnedValue::from(field_value);
+                    match value {
+                        OwnedValue::Str(s) => s,
+                        _ => String::new(),
                     }
-                })
-                .unwrap_or_default();
-            let path_str = doc
-                .get_first(self.path_field)
-                .map(|v| OwnedValue::from(v))
-                .and_then(|v| {
-                    if let OwnedValue::Str(s) = v {
-                        Some(s)
-                    } else {
-                        None
+                }
+                None => String::new(),
+            };
+
+            let path_str = match doc.get_first(self.path_field) {
+                Some(field_value) => {
+                    let value = OwnedValue::from(field_value);
+                    match value {
+                        OwnedValue::Str(s) => s,
+                        _ => String::new(),
                     }
-                })
-                .unwrap_or_default();
-            let content = doc
-                .get_first(self.content_field)
-                .map(|v| OwnedValue::from(v))
-                .and_then(|v| {
-                    if let OwnedValue::Str(s) = v {
-                        Some(s)
-                    } else {
-                        None
+                }
+                None => String::new(),
+            };
+
+            let content = match doc.get_first(self.content_field) {
+                Some(field_value) => {
+                    let value = OwnedValue::from(field_value);
+                    match value {
+                        OwnedValue::Str(s) => s,
+                        _ => String::new(),
                     }
-                })
-                .unwrap_or_default();
-            let start_line = doc
-                .get_first(self.start_line_field)
-                .map(|v| OwnedValue::from(v))
-                .and_then(|v| {
-                    if let OwnedValue::U64(n) = v {
-                        Some(n)
-                    } else {
-                        None
+                }
+                None => String::new(),
+            };
+
+            let start_line = match doc.get_first(self.start_line_field) {
+                Some(field_value) => {
+                    let value = OwnedValue::from(field_value);
+                    match value {
+                        OwnedValue::U64(n) => n as usize,
+                        _ => 0,
                     }
-                })
-                .unwrap_or(0) as usize;
-            let end_line = doc
-                .get_first(self.end_line_field)
-                .map(|v| OwnedValue::from(v))
-                .and_then(|v| {
-                    if let OwnedValue::U64(n) = v {
-                        Some(n)
-                    } else {
-                        None
+                }
+                None => 0,
+            };
+
+            let end_line = match doc.get_first(self.end_line_field) {
+                Some(field_value) => {
+                    let value = OwnedValue::from(field_value);
+                    match value {
+                        OwnedValue::U64(n) => n as usize,
+                        _ => 0,
                     }
-                })
-                .unwrap_or(0) as usize;
+                }
+                None => 0,
+            };
 
             results.push((
                 Chunk {
